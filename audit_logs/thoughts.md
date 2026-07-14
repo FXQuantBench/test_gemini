@@ -1,2 +1,1 @@
-<!-- Entry format: ## YYYY-MM-DD HH:MM — <EDA|Backtest|PR>
-<reasoning paragraph> -->
+<!-- CI appends UTC-dated entries from the model's thoughts response; do not replace this file. -->

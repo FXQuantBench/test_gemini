@@ -17,6 +17,10 @@ permissions:
   pull-requests: write
   actions: write
 
+concurrency:
+  group: agentic-loop-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   loop:
     runs-on: ubuntu-latest
@@ -226,7 +230,7 @@ jobs:
       - name: Append thoughts to audit_logs/thoughts.md
         if: env.SKIP_JOB != 'true'
         run: |
-          TIMESTAMP=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'))")
+          TIMESTAMP=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))")
           if [ "${{ github.actor }}" = "github-actions[bot]" ]; then
             LABEL="workflow_dispatch-resume"
           else
@@ -246,7 +250,13 @@ jobs:
           python3 - <<'PYEOF'
           import json, os, pathlib, sys
 
-          PROTECTED = {"test_runner.py", "prompt_context.md"}
+          PROTECTED = {
+              "audit_logs/thoughts.md",
+              "prompt_context.md",
+              "releases.md",
+              "research_summary.md",
+              "test_runner.py",
+          }
 
           with open("/tmp/response.json") as f:
               response = json.load(f)
@@ -272,6 +282,89 @@ jobs:
               print(f"Skipped protected files: {skipped}", file=sys.stderr)
           PYEOF
 
+          - name: Apply structured record updates
+          if: env.SKIP_JOB != 'true'
+          run: |
+            python3 - <<'PYEOF'
+            import json
+            import re
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            with open("/tmp/response.json", encoding="utf-8") as response_file:
+              response = json.load(response_file)
+
+            updates = response.get("record_updates", {})
+            commands = response.get("commands", [])
+            submitting_pr = any(command.strip() == "/submit-pr" for command in commands)
+
+            def utc_timestamp() -> str:
+              return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+            def update_research_summary() -> None:
+              research_updates = updates.get("research_updates", [])
+              if not research_updates:
+                return
+
+              path = Path("research_summary.md")
+              lines = path.read_text(encoding="utf-8").splitlines()
+              updates_by_id = {update["id"]: update for update in research_updates}
+              seen = set()
+              rewritten = []
+
+              for line in lines:
+                match = re.match(r"^\|\s*([^|]+?)\s*\|", line)
+                if not match or match.group(1).strip() not in updates_by_id:
+                  rewritten.append(line)
+                  continue
+
+                record_id = match.group(1).strip()
+                cells = [cell.strip() for cell in line.split("|")[1:-1]]
+                if len(cells) != 5:
+                  raise ValueError(f"Malformed research summary row for {record_id!r}.")
+                update = updates_by_id[record_id]
+                if "hypothesis" in update:
+                  cells[2] = update["hypothesis"].replace("|", "\\|")
+                if "verdict" in update:
+                  cells[4] = update["verdict"].replace("|", "\\|")
+                rewritten.append("| " + " | ".join(cells) + " |")
+                seen.add(record_id)
+
+              for record_id, update in updates_by_id.items():
+                if record_id in seen:
+                  continue
+                if "hypothesis" not in update:
+                  raise ValueError(
+                    f"Research update for unknown ID {record_id!r} needs a hypothesis."
+                  )
+                hypothesis = update["hypothesis"].replace("|", "\\|")
+                rewritten.append(
+                  f"| {record_id} | {datetime.now(timezone.utc).date().isoformat()} | "
+                  f"{hypothesis} |  |  |"
+                )
+
+              path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+            def append_release_note() -> None:
+              if not submitting_pr:
+                return
+              note = updates.get("release_note", "").strip()
+              if not note:
+                raise ValueError("A /submit-pr command requires record_updates.release_note.")
+
+              path = Path("releases.md")
+              content = path.read_text(encoding="utf-8")
+              versions = [int(value) for value in re.findall(r"^## \[v(\d+)\]", content, re.MULTILINE)]
+              next_version = max(versions, default=-1) + 1
+              with path.open("a", encoding="utf-8") as releases_file:
+                releases_file.write(
+                  f"\n## [v{next_version}] - {utc_timestamp()}\n\n{note}\n"
+                )
+
+            update_research_summary()
+            append_release_note()
+            PYEOF
+
       - name: Commit all changes
         if: env.SKIP_JOB != 'true'
         run: |
@@ -292,6 +385,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "${{ github.event.inputs.trigger_source || '' }}" = "catch_up_eval" ]; then
+            echo "Catch-up reflection complete; scheduling the next catch-up date."
+            gh workflow run catch_up_eval.yml \
+              --repo "${{ github.repository }}" \
+              --ref main \
+              -f resume_after_reflection=true
+            exit 0
+          fi
+
           python3 - <<'PYEOF'
           import json, os, subprocess, sys
 

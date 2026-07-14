@@ -27,6 +27,9 @@ on:
       resume_loop:
         description: "Whether the caller should resume the agent loop"
         value: ${{ jobs.eval.outputs.resume_loop }}
+        result_status:
+          description: "created, already_exists, or error"
+          value: ${{ jobs.eval.outputs.result_status }}
 
 permissions:
   contents: read
@@ -38,6 +41,7 @@ jobs:
     outputs:
       eval_date: ${{ steps.date.outputs.eval_date }}
       resume_loop: ${{ steps.resume_gate.outputs.resume_loop }}
+      result_status: ${{ steps.result_status.outputs.result_status }}
     env:
       EVAL_STAGE_ISOLATION: 'ephemeral_only'
       GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
@@ -386,3 +390,15 @@ jobs:
           git add "$DEST_PATH"
           git commit -m "eval: ${MODEL_ID} ${EVAL_DATE}"
           git push origin HEAD
+
+      - name: Record evaluation result status
+        id: result_status
+        if: always()
+        run: |
+          if [ "$SKIP_JOB" = 'true' ]; then
+            echo "result_status=already_exists" >> "$GITHUB_OUTPUT"
+          elif [ "${{ job.status }}" = 'success' ]; then
+            echo "result_status=created" >> "$GITHUB_OUTPUT"
+          else
+            echo "result_status=error" >> "$GITHUB_OUTPUT"
+          fi

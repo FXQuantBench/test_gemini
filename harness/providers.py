@@ -78,6 +78,29 @@ _FILE_CHANGE_SCHEMA = {
     "additionalProperties": False,
 }
 
+_RESEARCH_UPDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "hypothesis": {"type": "string"},
+        "verdict": {"type": "string"},
+    },
+    "required": ["id"],
+    "additionalProperties": False,
+}
+
+_RECORD_UPDATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "release_note": {"type": "string"},
+        "research_updates": {
+            "type": "array",
+            "items": _RESEARCH_UPDATE_SCHEMA,
+        },
+    },
+    "additionalProperties": False,
+}
+
 _RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -90,6 +113,7 @@ _RESPONSE_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
         },
+        "record_updates": _RECORD_UPDATES_SCHEMA,
     },
     "required": ["thoughts", "file_changes", "commands"],
     "additionalProperties": False,
@@ -112,6 +136,35 @@ def _validate_response(obj: Any, raw: str) -> dict:
         raise ValueError(f"'file_changes' must be a list. Raw: {raw}")
     if not isinstance(obj["commands"], list):
         raise ValueError(f"'commands' must be a list. Raw: {raw}")
+    if "record_updates" in obj:
+        updates = obj["record_updates"]
+        if not isinstance(updates, dict):
+            raise ValueError(f"'record_updates' must be an object. Raw: {raw}")
+        allowed = {"release_note", "research_updates"}
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(
+                f"'record_updates' contains unsupported keys {sorted(unknown)}. Raw: {raw}"
+            )
+        if "release_note" in updates and not isinstance(updates["release_note"], str):
+            raise ValueError(f"'record_updates.release_note' must be a string. Raw: {raw}")
+        if "research_updates" in updates:
+            research_updates = updates["research_updates"]
+            if not isinstance(research_updates, list):
+                raise ValueError(
+                    f"'record_updates.research_updates' must be a list. Raw: {raw}"
+                )
+            for update in research_updates:
+                if not isinstance(update, dict) or not isinstance(update.get("id"), str):
+                    raise ValueError(
+                        "Each research update must be an object with a string 'id'. "
+                        f"Raw: {raw}"
+                    )
+                if set(update) - {"id", "hypothesis", "verdict"}:
+                    raise ValueError(f"Research update contains unsupported keys. Raw: {raw}")
+                for key in ("hypothesis", "verdict"):
+                    if key in update and not isinstance(update[key], str):
+                        raise ValueError(f"'research_updates.{key}' must be a string. Raw: {raw}")
     return obj
 
 

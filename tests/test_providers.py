@@ -125,6 +125,32 @@ class TestValidateResponse:
         with pytest.raises(ValueError, match="file_changes.*list"):
             self._fn(bad, "raw")
 
+        def test_structured_record_updates_pass(self):
+            response = dict(
+                _VALID_RESPONSE,
+                record_updates={
+                    "release_note": "Adds a spread filter.",
+                    "research_updates": [
+                        {"id": "001_spread", "hypothesis": "Spreads widen at rollover."},
+                        {"id": "000_baseline", "verdict": "The baseline remains flat."},
+                    ],
+                },
+            )
+            assert self._fn(response, "raw")["record_updates"]["release_note"]
+
+        def test_record_updates_rejects_unknown_fields(self):
+            bad = dict(_VALID_RESPONSE, record_updates={"date": "2099-01-01"})
+            with pytest.raises(ValueError, match="unsupported keys"):
+                self._fn(bad, "raw")
+
+        def test_research_update_requires_string_id(self):
+            bad = dict(
+                _VALID_RESPONSE,
+                record_updates={"research_updates": [{"id": 1, "hypothesis": "x"}]},
+            )
+            with pytest.raises(ValueError, match="string 'id'"):
+                self._fn(bad, "raw")
+
 
 # ---------------------------------------------------------------------------
 # openai_compatible adapter

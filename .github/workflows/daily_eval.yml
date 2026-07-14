@@ -1,6 +1,8 @@
 name: Daily Eval
 
 on:
+  schedule:
+    - cron: '30 8 * * 2-6'
   workflow_dispatch:
     inputs:
       eval_date:
@@ -12,6 +14,10 @@ permissions:
   contents: read
   packages: read
   actions: write
+
+concurrency:
+  group: model-eval-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   eval:

@@ -44,13 +44,15 @@ model-template/
 │   └── call_model.py        # CLI wrapper invoked by the agentic loop workflow
 ├── tests/                   # Unit tests
 └── .github/
+    ├── catchup_state.json    # One-time post-release evaluation progress
     ├── loop_state.json       # Agentic loop counters (last_run, daily_count)
     └── workflows/
         ├── agentic_loop.yml  # Core loop — triggers after EDA or backtest completes
         ├── run_eda.yml       # Dispatches EDA into the infra-managed strategy-runner image
         ├── run_backtest.yml  # Dispatches a full vectorbt backtest into the infra-managed strategy-runner image
         ├── pr_guard.yml      # Enforces quality gates on PRs to main
-        └── daily_eval.yml    # Out-of-sample eval, runs Tue–Sat at 08:30 UTC
+        ├── daily_eval.yml    # Out-of-sample eval, runs Tue–Sat at 08:30 UTC
+        └── catch_up_eval.yml # One-time chronological eval after first release
 ```
 
 ---
@@ -109,12 +111,10 @@ Go to **Settings → Secrets and variables → Actions → Variables** and add:
 |---|---|---|---|
 | `MODEL_PROVIDER` | Yes | LLM provider — `openai`, `anthropic`, or `google` | `openai` |
 | `MODEL_ID` | Yes | Model identifier string | `gpt-4o` |
-| `IN_SAMPLE_START` | Yes | Inclusive start of the training window (`YYYY-MM-DD`) | `2022-01-03` |
-| `IN_SAMPLE_END` | Yes | Exclusive end of the training window (`YYYY-MM-DD`) | `2024-01-01` |
 | `MODEL_BASE_URL` | No | Override the API base URL for `openai` provider (any OpenAI-compatible endpoint) | `https://api.mistral.ai/v1` |
 | `STRATEGY_RUNNER_IMAGE` | No | Override the infra-managed runner image reference used by EDA, backtest, and eval workflows | `ghcr.io/fxquantbench/strategy-runner:2026-05-10` |
 | `MAX_DAILY_ITERATIONS` | No | Max agentic loop runs per day (default: `6`) | `6` |
-| `EDA_ARCHIVE_THRESHOLD` | No | Archive oldest EDA files when count exceeds this (default: `30`) | `30` |
+| `ARTIFACT_ARCHIVE_THRESHOLD` | No | Archive oldest EDA script/log bundles and backtest logs when the active count reaches this threshold (default: `30`) | `30` |
 
 #### 3.4.1 Choose a provider and model
 
@@ -133,9 +133,9 @@ The model receives the full `prompt_context.md` as the system prompt plus dynami
 
 #### 3.4.2 Set the in-sample date window
 
-`IN_SAMPLE_START` and `IN_SAMPLE_END` define the GBPUSD tick data window the model is allowed to train on. The runner enforces a strict `[start, end)` window — no data outside this range is accessible during EDA or backtest.
+The GBPUSD in-sample window is fixed for every template-derived repository: inclusive `2025-01-01` through inclusive `2026-05-31`. The runner enforces the equivalent half-open interval `[2025-01-01, 2026-06-01)` — no data outside this range is accessible during EDA or backtest. No date variables need to be configured when creating a repository.
 
-EDA and backtest now stage the available in-sample parquet day shards locally on the GitHub runner and pass them into the strategy-runner container via `TICK_DATA_GLOB=/input/*.parquet`. Those workflows may restore a fixed-window cache keyed by `IN_SAMPLE_START` and `IN_SAMPLE_END` to avoid re-downloading the same shards, and they skip calendar days that have no published shard in the dataset. Daily eval uses its own ephemeral stage directory and must not restore that in-sample cache.
+EDA and backtest stage the available in-sample parquet day shards locally on the GitHub runner and pass them into the strategy-runner container via `TICK_DATA_GLOB=/input/*.parquet`. Those workflows restore a cache keyed by the fixed start and end dates to avoid re-downloading the same shards, and they skip calendar days that have no published shard in the dataset. Daily eval uses its own ephemeral stage directory and must not restore that in-sample cache.
 
 Choose dates that leave at least 6 months of unseen data for out-of-sample evaluation. The daily eval job tests `strategy.py` on yesterday's ticks (always outside the in-sample window).
 
@@ -190,6 +190,8 @@ Each `agentic_loop.yml` invocation increments `daily_count` before it dispatches
 
 The loop context now includes the latest leaderboard summaries for both backtest and eval runs. After a scheduled daily eval resumes the loop, the agent can inspect the newest eval metrics directly from the injected context before choosing its next action.
 
+After the first strategy reaches `main`, a one-time catch-up starts at `2026-06-01`. It evaluates one business day at a time through the date before the next regular daily evaluation, then gives the model one reflection-only turn before continuing. Catch-up uses the same isolated daily-eval path and the current `main` strategy, shares the normal `MAX_DAILY_ITERATIONS` ceiling, and resumes after the UTC daily counter resets. It is not restarted for later releases; after completion, the strategy participates only in regular daily evaluation.
+
 EDA scripts run inside `test_runner.py` with `conn` and `pairs = ["GBPUSD"]` injected into the script namespace. Use `conn.execute(...)` against the preloaded `GBPUSD` view instead of opening a fresh DuckDB connection. Do not use `duckdb.sql(...)` for benchmark queries: it uses DuckDB's default connection rather than the injected runner connection, which is why logs can show `Catalog Error: Table with name GBPUSD does not exist!` even though the runner created the view correctly. If you wrap logic in a helper, use `def main(conn): ...` and call `main(conn)`. EDA and backtest restore or build an exact-window local shard stage before the container runs, while daily eval keeps a separate ephemeral stage so out-of-sample data never becomes restorable by dev workflows. The EDA workflow copies only the first non-empty log line into `research_summary.md`, and a committed `research/<file_id>.log` causes future `/run-eda <file_id>` attempts to be skipped, so retries need a new file ID.
 
 For a live sanity check against real staged HF data, run `python scripts/check_hf_dataset_access.py ...`. It exercises both the documented SQL queries and a sample EDA script executed through `test_runner.py` with the injected `conn`.
@@ -201,10 +203,10 @@ For a live sanity check against real staged HF data, run `python scripts/check_h
 | File | Who can modify | Notes |
 |---|---|---|
 | `strategy.py` | Agent and contributors | The only strategy file the runner executes |
-| `audit_logs/thoughts.md` | Agent only | Updated every iteration; required before issuing commands |
-| `releases.md` | Agent and contributors | Must contain a `## [vN]` entry before each PR to main |
+| `audit_logs/thoughts.md` | Workflow-owned | Appends the model's `thoughts` with a system-generated UTC timestamp |
+| `releases.md` | Workflow and contributors | CI appends the system-generated timestamp and next `## [vN]` for a model-supplied release note |
 | `research/` | Agent only | EDA scripts and output logs, auto-managed |
-| `research_summary.md` | Agent only | EDA findings table, auto-maintained |
+| `research_summary.md` | Workflow and agent | CI owns dates and findings; the model supplies targeted hypothesis/verdict updates |
 | `test_runner.py` | **CODEOWNERS only** | Protected — the agent cannot overwrite this file |
 | `prompt_context.md` | Contributors | Defines the LLM's task and data contract — customise to guide your model |
 

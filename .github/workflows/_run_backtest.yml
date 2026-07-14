@@ -16,6 +16,11 @@ on:
       in_sample_end:
         required: true
         type: string
+      artifact_archive_threshold:
+        description: "Archive oldest development artifacts when count reaches this threshold"
+        required: false
+        type: string
+        default: "30"
       runner_image:
         description: "Infra-managed strategy runner image reference"
         required: false
@@ -31,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+      ARTIFACT_ARCHIVE_THRESHOLD: ${{ inputs.artifact_archive_threshold }}
       INSAMPLE_CACHE_NAMESPACE: 'gbpusd-insample-v1'
       RUNNER_IMAGE: ${{ inputs.runner_image }}
 
@@ -481,6 +487,28 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(summary)
           PYEOF
+
+          - name: Archive old backtest artifacts when threshold is reached
+          if: always()
+          run: |
+            python3 - <<'PYEOF'
+            import os
+            from pathlib import Path
+            import shutil
+
+            threshold = int(os.environ.get("ARTIFACT_ARCHIVE_THRESHOLD", "30"))
+            results = Path("backtest_results")
+            archive = results / "archive"
+            logs = sorted(results.glob("*.log"), key=lambda path: path.name)
+
+            if len(logs) < threshold:
+              raise SystemExit(0)
+
+            archive.mkdir(parents=True, exist_ok=True)
+            for log in logs[: len(logs) - 10]:
+              shutil.move(str(log), str(archive / log.name))
+              print(f"Archived: {log.name}")
+            PYEOF
 
       # ── UPDATED: always commit backtest_results/ + releases.md ──────────
       - name: Commit backtest_results/ and releases.md and push

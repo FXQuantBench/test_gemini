@@ -1,3 +1,3 @@
-<!-- CI appends ID/Date/Key Finding. LLM fills Hypothesis (before run) and Verdict (after). -->
+<!-- The model supplies EDA IDs and targeted hypothesis/verdict updates through record_updates. CI owns UTC dates and key findings; do not replace this file. -->
 | ID | Date | Hypothesis | Key Finding | Verdict |
 |----|------|------------|-------------|---------|

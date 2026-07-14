@@ -16,7 +16,7 @@ You operate in an agentic loop: you receive context, reason, write or update fil
 
 ## 2. Data
 
-A DuckDB view named `GBPUSD` is pre-loaded for you. It contains only rows strictly within `[IN_SAMPLE_START, IN_SAMPLE_END)` — no data outside this window is accessible.
+A DuckDB view named `GBPUSD` is pre-loaded for you. It contains only rows strictly within the fixed in-sample window `[2025-01-01, 2026-06-01)` — no data outside this window is accessible.
 
 **Columns:**
 
@@ -36,7 +36,7 @@ A DuckDB view named `GBPUSD` is pre-loaded for you. It contains only rows strict
 - Do not open a fresh DuckDB connection with `duckdb.connect()` or `duckdb.query()` when you need benchmark data. A new connection will not have the preloaded `GBPUSD` view.
 - Do not use module-level `duckdb.sql(...)`, `duckdb.query(...)`, or similar helpers for benchmark queries. Those use DuckDB's default connection, not the injected `conn`, so they commonly fail with `Catalog Error: Table with name GBPUSD does not exist!`.
 - Query only the preloaded `GBPUSD` view. Do not call `read_parquet`, do not access HF/S3/local parquet paths directly from model-written code, and do not `CREATE OR REPLACE VIEW GBPUSD`.
-- The `GBPUSD` view is already filtered to `[IN_SAMPLE_START, IN_SAMPLE_END)` in both EDA and backtest mode.
+- The `GBPUSD` view is already filtered to `[2025-01-01, 2026-06-01)` in both EDA and backtest mode.
 - `timestamp_utc` is Unix milliseconds (UTC). There is no seconds-based timestamp column. To convert: `pd.to_datetime(df["timestamp_utc"], unit="ms", utc=True)`.
 - There is no `pair` column in the `GBPUSD` SQL view. Add `pair = "GBPUSD"` only in the returned signal DataFrame.
 - If row order matters, always `ORDER BY timestamp_utc`.
@@ -206,9 +206,9 @@ A strategy that achieves Sharpe 2.0 in one backtest but degrades to Sharpe 0.2 a
 |---|---|---|
 | `strategy.py` | **R/W** | Your primary strategy implementation |
 | `research/*.py` | **R/W** | EDA scripts; each runs in isolation via `/run-eda <file_id>` with injected `conn` and `pairs` globals |
-| `research_summary.md` | **R/W** | Fill `Hypothesis` before each EDA run; fill `Verdict` after seeing results |
-| `thoughts.md` | **R/W** (via `audit_logs/thoughts.md`) | Update with reasoning before every run command |
-| `releases.md` | **R/W** | Add a `[vN]` entry before every `/submit-pr` command |
+| `research_summary.md` | **R/W via `record_updates`** | Supply a hypothesis before EDA and a verdict after results; CI owns IDs and dates |
+| `thoughts.md` | **Workflow-owned** | Your `thoughts` response is appended with a UTC timestamp before every command |
+| `releases.md` | **R/W via `record_updates`** | Supply a release-note body before `/submit-pr`; CI assigns the UTC timestamp and next `[vN]` |
 | `test_runner.py` | **R/O** | Execution engine — writes are silently rejected |
 | `prompt_context.md` | **R/O** | This file — writes are silently rejected |
 | `research/*.log` | **R/O** | EDA output logs; written by the runner after each `/run-eda` run; named `<file_id>.log`. Read these to see EDA results. |
@@ -225,6 +225,8 @@ A strategy that achieves Sharpe 2.0 in one backtest but degrades to Sharpe 0.2 a
 The loop context includes the latest leaderboard summaries for both backtest results and eval results. When the trigger says `daily_eval`, inspect the latest eval summary before deciding whether more EDA, a backtest, or a PR is justified.
 
 Every parent loop iteration consumes one unit from `MAX_DAILY_ITERATIONS`. Manual `workflow_dispatch` runs must respect the 30-minute gap, but child-workflow resumes bypass that guard while still counting against the daily limit.
+
+After the first strategy is released to `main`, CI performs a one-time chronological catch-up from 2026-06-01. Each catch-up date uses the same daily-eval workflow as the regular schedule, then triggers one reflection-only loop turn before moving to the next business day. During a `catch_up_eval` trigger, inspect the result and update reasoning or development files, but do not issue a command: CI schedules the next date after this reflection. Catch-up pauses at `MAX_DAILY_ITERATIONS` and resumes automatically after the UTC counter resets; it stops before the next regular daily-eval target so no date is evaluated twice.
 
 Only the first valid command in `commands` is executed. Because iterations are budgeted, avoid low-value environment-probing EDA scripts when the contract is already documented here.
 
@@ -274,13 +276,21 @@ You must respond with a single JSON object and nothing else:
   "file_changes": [
     {"path": "<relative file path>", "content": "<full file content>"}
   ],
-  "commands": ["<command string>"]
+  "commands": ["<command string>"],
+  "record_updates": {
+    "release_note": "<date-free release-note body>",
+    "research_updates": [
+      {"id": "<file_id>", "hypothesis": "<date-free hypothesis>"},
+      {"id": "<file_id>", "verdict": "<date-free verdict>"}
+    ]
+  }
 }
 ```
 
 - `thoughts` — required; your reasoning for this iteration
 - `file_changes` — list of files to write; each entry replaces the full file content; may be empty
 - `commands` — list of commands; only the **first valid command** is executed per iteration
+- `record_updates` — optional structured updates for workflow-owned records; do not include dates, release versions, or markdown headings
 
 **Valid commands:**
 
@@ -294,11 +304,11 @@ You must respond with a single JSON object and nothing else:
 
 ## 7. Rules
 
-1. **Update `audit_logs/thoughts.md` before every run command.** Include `thoughts.md` in `file_changes` with a new `## YYYY-MM-DD HH:MM — <EDA|Backtest|PR>` entry. If `thoughts.md` was not modified in the latest commit, `run_eda` and `run_backtest` will exit with an error.
+1. **Provide `thoughts` before every run command.** CI appends it to `audit_logs/thoughts.md` with a system-generated UTC timestamp. Never include `audit_logs/thoughts.md` in `file_changes`.
 
-2. **Update `releases.md` before every `/submit-pr`.** Add a `## [vN]` entry describing what changed and why it should improve OOS Sharpe. `pr_guard` will block the PR if no new version entry is present.
+2. **Provide a release note before every `/submit-pr`.** Set `record_updates.release_note` to a date-free description of what changed and why it should improve OOS Sharpe. CI appends the timestamp and next `[vN]`; never include `releases.md` in `file_changes`.
 
-3. **Fill `Verdict` in `research_summary.md` after every EDA result.** After `run_eda` completes and you see the log, write a one-sentence verdict in the corresponding table row before issuing the next command.
+3. **Use structured EDA record updates.** Before an EDA run, set `record_updates.research_updates` with the new script ID and hypothesis. After the result, set its verdict using the same ID. CI owns the date and key-finding fields; never replace `research_summary.md` in `file_changes`.
 
 4. **Never attempt to write `test_runner.py` or `prompt_context.md`.** Writes to these files are silently dropped and will not take effect.
 
