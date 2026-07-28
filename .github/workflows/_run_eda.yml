@@ -1,0 +1,503 @@
+name: _Run EDA (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "Caller repository (owner/repo)"
+        required: true
+        type: string
+      file_id:
+        description: "EDA script ID (runs research/<file_id>.py)"
+        required: true
+        type: string
+      in_sample_start:
+        description: "Inclusive in-sample start date for the preloaded GBPUSD view"
+        required: true
+        type: string
+      in_sample_end:
+        description: "Exclusive in-sample end date for the preloaded GBPUSD view"
+        required: true
+        type: string
+      artifact_archive_threshold:
+        description: "Archive oldest development artifacts when count reaches this threshold"
+        required: false
+        type: string
+        default: "30"
+      runner_image:
+        description: "Infra-managed strategy runner image reference"
+        required: false
+        type: string
+        default: "ghcr.io/fxquantbench/strategy-runner:latest"
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  eda:
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACT_ARCHIVE_THRESHOLD: ${{ inputs.artifact_archive_threshold }}
+      EDA_EMPTY_LOG: 'false'
+      GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+      INSAMPLE_CACHE_NAMESPACE: 'gbpusd-insample-v1'
+      RUNNER_IMAGE: ${{ inputs.runner_image }}
+      SKIP_JOB: 'false'
+
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          token: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+          fetch-depth: 0
+          ref: dev
+
+      - name: Configure git
+        run: |
+          git config user.name  "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+
+      - name: Guard — already run
+        run: |
+          if [ -f "research/${{ inputs.file_id }}.log" ]; then
+            echo "Exiting: research/${{ inputs.file_id }}.log already exists (already run)."
+            echo "SKIP_JOB=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Guard — thoughts.md updated in latest commit
+        if: env.SKIP_JOB != 'true'
+        run: |
+          if ! git log --name-only --pretty="" -3 HEAD | grep -q "audit_logs/thoughts.md"; then
+            mkdir -p "$RUNNER_TEMP/eda_output"
+            printf '%s\n' \
+              "ERROR: audit_logs/thoughts.md was not updated in the last 3 commits." \
+              "You must update thoughts.md with your reasoning before calling /run-eda." \
+              "Fix: edit audit_logs/thoughts.md and commit it, then re-run." \
+              > "$RUNNER_TEMP/eda_output/eda.log"
+            exit 1
+          fi
+
+      - name: Guard — EDA script exists
+        if: env.SKIP_JOB != 'true'
+        run: |
+          if [ ! -f "research/${{ inputs.file_id }}.py" ]; then
+            mkdir -p "$RUNNER_TEMP/eda_output"
+            printf '%s\n' \
+              "ERROR: research/${{ inputs.file_id }}.py does not exist on the dev branch." \
+              "Fix: ensure the file is committed to research/ before calling /run-eda." \
+              > "$RUNNER_TEMP/eda_output/eda.log"
+            exit 1
+          fi
+
+      - name: Restore canonical test_runner.py
+        if: env.SKIP_JOB != 'true'
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/fxquantbench/model-template/main/test_runner.py \
+            -o test_runner.py
+
+      - name: Log in to GHCR
+        if: env.SKIP_JOB != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: benchmark-bot
+          password: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+      - name: Resolve strategy runner image
+        if: env.SKIP_JOB != 'true'
+        run: |
+          REQUESTED_IMAGE="$RUNNER_IMAGE"
+          if docker pull "$REQUESTED_IMAGE"; then
+            exit 0
+          fi
+
+          echo "WARNING: Unable to pull $REQUESTED_IMAGE from GHCR."
+          echo "Private GHCR pulls require Manage Actions access on the strategy-runner package."
+
+          if [[ "$REQUESTED_IMAGE" != ghcr.io/fxquantbench/strategy-runner* ]]; then
+            echo "ERROR: $REQUESTED_IMAGE is not the infra-managed strategy-runner image, so no local build fallback is available."
+            exit 1
+          fi
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          echo "Falling back to a local build from fxquantbench/infra."
+          gh repo clone fxquantbench/infra "$TMP_DIR/infra" -- --depth=1
+
+          LOCAL_RUNNER_IMAGE="strategy-runner-local:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build \
+            -t "$LOCAL_RUNNER_IMAGE" \
+            -f "$TMP_DIR/infra/docker/Dockerfile.strategy" \
+            "$TMP_DIR/infra"
+
+          echo "RUNNER_IMAGE=$LOCAL_RUNNER_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Compute in-sample cache metadata
+        if: env.SKIP_JOB != 'true'
+        id: insample_cache_metadata
+        run: |
+          STAGE_DIR="$RUNNER_TEMP/insample_input"
+          mkdir -p "$STAGE_DIR"
+          echo "stage_dir=$STAGE_DIR" >> "$GITHUB_OUTPUT"
+          echo "cache_key=${{ env.INSAMPLE_CACHE_NAMESPACE }}-${{ runner.os }}-${{ inputs.in_sample_start }}-${{ inputs.in_sample_end }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore in-sample shard cache
+        if: env.SKIP_JOB != 'true'
+        id: restore_insample_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+          key: ${{ steps.insample_cache_metadata.outputs.cache_key }}
+
+      - name: Verify staged in-sample shards
+        if: env.SKIP_JOB != 'true'
+        id: verify_insample_cache
+        env:
+          HF_TOKEN_RO: ${{ secrets.HF_TOKEN_RO }}
+          IN_SAMPLE_START: ${{ inputs.in_sample_start }}
+          IN_SAMPLE_END: ${{ inputs.in_sample_end }}
+          STAGE_DIR: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check huggingface_hub
+          python3 - <<'PYEOF'
+          import os
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          from huggingface_hub import HfFileSystem
+
+          start = date.fromisoformat(os.environ["IN_SAMPLE_START"])
+          end = date.fromisoformat(os.environ["IN_SAMPLE_END"])
+          stage_dir = Path(os.environ["STAGE_DIR"])
+          manifest_path = stage_dir / "manifest.txt"
+
+          expected = []
+          skipped = []
+          if manifest_path.exists():
+            expected = [
+              line.strip()
+              for line in manifest_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+            ]
+          else:
+            token = os.environ["HF_TOKEN_RO"]
+            hffs = HfFileSystem(token=token)
+            day = start
+            while day < end:
+              local_name = f"ticks_{day.isoformat()}.parquet"
+              dataset_path = (
+                "datasets/FXQuantBench/fx-ticks/"
+                f"GBPUSD/{day:%Y/%m/%d}/{local_name}"
+              )
+              if hffs.exists(dataset_path):
+                expected.append(local_name)
+              else:
+                skipped.append(day.isoformat())
+                print(
+                  f"Skipping unavailable shard day {day.isoformat()}: {dataset_path}"
+                )
+              day += timedelta(days=1)
+
+            if not expected:
+              raise RuntimeError(
+                "No in-sample parquet shards were found for the requested window."
+              )
+
+            manifest_path.write_text(
+              "".join(f"{name}\n" for name in expected),
+              encoding="utf-8",
+            )
+
+          expected_set = set(expected)
+          actual = sorted(path.name for path in stage_dir.glob("*.parquet"))
+          missing = [name for name in expected if name not in expected_set.intersection(actual)]
+          unexpected = [name for name in actual if name not in expected_set]
+          cache_complete = not missing and not unexpected
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+            fh.write(f"expected_count={len(expected)}\n")
+            fh.write(f"skipped_count={len(skipped)}\n")
+            fh.write(f"cache_complete={'true' if cache_complete else 'false'}\n")
+
+          print(
+            f"Staged shard check: expected={len(expected)} actual={len(actual)} "
+            f"missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}"
+          )
+          for name in missing:
+            print(f"Missing shard: {name}")
+          for name in unexpected:
+            print(f"Unexpected shard: {name}")
+          PYEOF
+
+      - name: Stage in-sample shards locally
+        if: env.SKIP_JOB != 'true' && steps.verify_insample_cache.outputs.cache_complete != 'true'
+        env:
+          HF_TOKEN_RO: ${{ secrets.HF_TOKEN_RO }}
+          STAGE_DIR: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import shutil
+          from datetime import date
+          from pathlib import Path
+
+          from huggingface_hub import hf_hub_download
+
+          stage_dir = Path(os.environ["STAGE_DIR"])
+          stage_dir.mkdir(parents=True, exist_ok=True)
+          manifest_path = stage_dir / "manifest.txt"
+
+          if not manifest_path.exists():
+            raise RuntimeError(
+              "Expected manifest.txt describing available in-sample shards."
+            )
+
+          expected_names = [
+            line.strip()
+            for line in manifest_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+          ]
+          if not expected_names:
+            raise RuntimeError(
+              "No in-sample parquet shards were resolved for the requested window."
+            )
+
+          expected = {}
+          for local_name in expected_names:
+            day = date.fromisoformat(
+              local_name.removeprefix("ticks_").removesuffix(".parquet")
+            )
+            expected[local_name] = f"GBPUSD/{day:%Y/%m/%d}/{local_name}"
+
+          for path in stage_dir.glob("*.parquet"):
+            if path.name not in expected:
+              path.unlink()
+              print(f"Removed unexpected shard {path.name}")
+
+          token = os.environ["HF_TOKEN_RO"]
+          if expected and not token:
+            raise RuntimeError("HF_TOKEN_RO is required to stage in-sample shards.")
+
+          downloaded = 0
+          for local_name, repo_filename in expected.items():
+            target_path = stage_dir / local_name
+            if target_path.exists():
+              continue
+            cached_path = Path(
+              hf_hub_download(
+                repo_id="FXQuantBench/fx-ticks",
+                repo_type="dataset",
+                filename=repo_filename,
+                token=token,
+              )
+            )
+            shutil.copyfile(cached_path, target_path)
+            print(f"Staged {repo_filename} -> {target_path}")
+            downloaded += 1
+
+          manifest_path = stage_dir / "manifest.txt"
+          manifest_path.write_text(
+            "".join(f"{name}\n" for name in sorted(expected)),
+            encoding="utf-8",
+          )
+          print(
+            f"Ready: expected={len(expected)} downloaded={downloaded} stage_dir={stage_dir}"
+          )
+          PYEOF
+          chmod -R a+rX "$STAGE_DIR"
+          ls -lah "$STAGE_DIR"
+
+      - name: Save in-sample shard cache
+        if: env.SKIP_JOB != 'true' && steps.restore_insample_cache.outputs.cache-hit != 'true' && steps.verify_insample_cache.outputs.expected_count != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+          key: ${{ steps.insample_cache_metadata.outputs.cache_key }}
+
+      - name: Write in-sample stage summary
+        if: env.SKIP_JOB != 'true'
+        env:
+          CACHE_COMPLETE: ${{ steps.verify_insample_cache.outputs.cache_complete }}
+          CACHE_HIT: ${{ steps.restore_insample_cache.outputs.cache-hit }}
+          EXPECTED_COUNT: ${{ steps.verify_insample_cache.outputs.expected_count }}
+          SKIPPED_COUNT: ${{ steps.verify_insample_cache.outputs.skipped_count }}
+          STAGE_DIR: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+        run: |
+          SHARD_COUNT=$(find "$STAGE_DIR" -maxdepth 1 -name '*.parquet' | wc -l | tr -d ' ')
+          CACHE_HIT_VALUE="${CACHE_HIT:-false}"
+          CACHE_COMPLETE_VALUE="${CACHE_COMPLETE:-false}"
+          SKIPPED_COUNT_VALUE="${SKIPPED_COUNT:-0}"
+          echo "In-sample shard stage: cache_hit=${CACHE_HIT_VALUE} shard_count=${SHARD_COUNT}/${EXPECTED_COUNT} skipped_missing_days=${SKIPPED_COUNT_VALUE} cache_complete=${CACHE_COMPLETE_VALUE}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run EDA container
+        if: env.SKIP_JOB != 'true'
+        id: run_eda
+        run: |
+          mkdir -p "$RUNNER_TEMP/eda_output"
+          chmod 0777 "$RUNNER_TEMP/eda_output"
+          docker run \
+            --memory=12g \
+            --cpus=4 \
+            --rm \
+            --workdir /output \
+            -e MODE=eda \
+            -e HF_TOKEN="${{ secrets.HF_TOKEN_RO }}" \
+            -e START_DATE="${{ inputs.in_sample_start }}" \
+            -e END_DATE="${{ inputs.in_sample_end }}" \
+            -e EDA_SCRIPT="/sandbox/research/${{ inputs.file_id }}.py" \
+            -e EDA_OUTPUT="/output/eda.log" \
+            -e TICK_DATA_GLOB="/input/*.parquet" \
+            -v "$GITHUB_WORKSPACE:/sandbox:ro" \
+            -v "${{ steps.insample_cache_metadata.outputs.stage_dir }}:/input:ro" \
+            -v "$RUNNER_TEMP/eda_output:/output" \
+            "$RUNNER_IMAGE" \
+            python /sandbox/test_runner.py \
+            2>"$RUNNER_TEMP/eda_output/eda.stderr"
+
+          if [ ! -f "$RUNNER_TEMP/eda_output/eda.log" ]; then
+            echo "ERROR: EDA runner completed without writing /output/eda.log."
+            exit 1
+          fi
+          
+      - name: Capture EDA container failure
+        if: env.SKIP_JOB != 'true' && steps.run_eda.outcome == 'failure'
+        run: |
+          LOG="$RUNNER_TEMP/eda_output/eda.log"
+          STDERR="$RUNNER_TEMP/eda_output/eda.stderr"
+          mkdir -p "$RUNNER_TEMP/eda_output"
+          sudo chown "$USER" "$LOG" 2>/dev/null || true
+
+          LOG_SIZE=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+          if [ "$LOG_SIZE" -lt 10 ]; then
+            printf '%s\n' \
+              "ERROR exit=137: OOM kill — container exceeded 4 GB memory limit." \
+              "Use aggregated DuckDB queries. Avoid SELECT * FROM GBPUSD into pandas." \
+              "Prefer GROUP BY/LIMIT queries. Call gc.collect() after large DataFrames." \
+              > "$LOG"
+          fi
+
+      - name: Truncate log to 5 MB
+        if: env.SKIP_JOB != 'true' && (success() || failure())
+        run: |
+          LOG_PATH="$RUNNER_TEMP/eda_output/eda.log"
+          MAX_BYTES=$(( 5 * 1024 * 1024 ))
+          SIZE=$(stat -c%s "$LOG_PATH" 2>/dev/null || echo 0)
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            truncate -s "$MAX_BYTES" "$LOG_PATH"
+            echo "" >> "$LOG_PATH"
+            echo "[output truncated at 5 MB]" >> "$LOG_PATH"
+          fi
+
+      - name: Guard — empty EDA log
+        if: env.SKIP_JOB != 'true' && (success() || failure())
+        run: |
+          LOG_PATH="$RUNNER_TEMP/eda_output/eda.log"
+          if ! grep -q '[^[:space:]]' "$LOG_PATH"; then
+            echo "EDA_EMPTY_LOG=true" >> "$GITHUB_ENV"
+            printf '%s\n' \
+              'ERROR: EDA script completed without printing any output.' \
+              'Print a concise first-line result summary and use a new file_id for the next attempt.' \
+              > "$LOG_PATH"
+          fi
+
+      - name: Copy log to research/
+        if: env.SKIP_JOB != 'true' && (success() || failure())
+        run: |
+          mkdir -p research
+          cp "$RUNNER_TEMP/eda_output/eda.log" "research/${{ inputs.file_id }}.log"
+          echo "=== [DEBUG] research/ after copy ==="
+          ls -lah research/*.log 2>/dev/null || echo "No .log files in research/"
+          echo "=== [DEBUG] log content preview (first 5 lines) ==="
+          head -5 "research/${{ inputs.file_id }}.log" || echo "File not found"
+
+      - name: Record EDA finding in research_summary.md
+        if: env.SKIP_JOB != 'true' && (success() || failure())
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          file_id = "${{ inputs.file_id }}"
+          log_path = Path(f"research/{file_id}.log")
+          first_line = next(
+            (line.strip() for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()),
+            "(no output)",
+          ).replace("|", "\\|")
+
+          summary_path = Path("research_summary.md")
+          lines = summary_path.read_text(encoding="utf-8").splitlines()
+          found = False
+          rewritten = []
+          for line in lines:
+            match = re.match(r"^\|\s*([^|]+?)\s*\|", line)
+            if not match or match.group(1).strip() != file_id:
+              rewritten.append(line)
+              continue
+            cells = [cell.strip() for cell in line.split("|")[1:-1]]
+            if len(cells) != 5:
+              raise ValueError(f"Malformed research summary row for {file_id!r}.")
+            cells[3] = first_line
+            rewritten.append("| " + " | ".join(cells) + " |")
+            found = True
+
+          if not found:
+            today = datetime.now(timezone.utc).date().isoformat()
+            rewritten.append(f"| {file_id} | {today} |  | {first_line} |  |")
+          summary_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+          PYEOF
+
+      - name: Archive old EDA artifacts when threshold is reached
+        if: env.SKIP_JOB != 'true' && (success() || failure())
+        run: |
+          python3 - <<'PYEOF'
+          import os, pathlib, shutil
+
+          threshold = int(os.environ.get("ARTIFACT_ARCHIVE_THRESHOLD", "30"))
+          research = pathlib.Path("research")
+          archive  = research / "archive"
+
+          bundles = sorted(
+              (p for p in research.glob("*.py")),
+              key=lambda p: p.name   # sort by filename, not mtime — checkout resets mtime
+          )
+          count = len(bundles)
+
+          if count >= threshold:
+              archive.mkdir(parents=True, exist_ok=True)
+              to_move = count - 10
+              for py in bundles[:to_move]:
+                  log = py.with_suffix(".log")
+                  shutil.move(str(py), str(archive / py.name))
+                  if log.exists():
+                      shutil.move(str(log), str(archive / log.name))
+                  print(f"Archived: {py.name}")
+          PYEOF
+
+          echo "=== [DEBUG] research/ after archive ==="
+          ls -lah research/*.log 2>/dev/null || echo "No .log files in research/"
+          echo "=== [DEBUG] research/archive/ ==="
+          ls -lah research/archive/*.log 2>/dev/null || echo "No .log files in research/archive/"
+
+      - name: Commit and push
+        if: env.SKIP_JOB != 'true' && (success() || failure())
+        run: |
+          echo "=== [DEBUG] git status before add ==="
+          git status --short research/
+          git add research/
+          git add research_summary.md
+          echo "=== [DEBUG] git diff --cached (staged files) ==="
+          git diff --cached --name-status
+          git diff --cached --quiet && echo "No changes." || \
+            git commit -m "eda: ${{ inputs.file_id }}"
+          git push origin dev
+
+      - name: Fail workflow on empty EDA log
+        if: env.EDA_EMPTY_LOG == 'true'
+        run: |
+          echo "ERROR: EDA log was empty; wrote a sentinel log entry and failed the workflow intentionally."
+          exit 1

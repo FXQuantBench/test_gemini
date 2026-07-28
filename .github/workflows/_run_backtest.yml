@@ -1,0 +1,522 @@
+name: _Run Backtest (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "Caller repository (owner/repo)"
+        required: true
+        type: string
+      model_id:
+        required: true
+        type: string
+      in_sample_start:
+        required: true
+        type: string
+      in_sample_end:
+        required: true
+        type: string
+      artifact_archive_threshold:
+        description: "Archive oldest development artifacts when count reaches this threshold"
+        required: false
+        type: string
+        default: "30"
+      runner_image:
+        description: "Infra-managed strategy runner image reference"
+        required: false
+        type: string
+        default: "ghcr.io/fxquantbench/strategy-runner:latest"
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+      ARTIFACT_ARCHIVE_THRESHOLD: ${{ inputs.artifact_archive_threshold }}
+      INSAMPLE_CACHE_NAMESPACE: 'gbpusd-insample-v1'
+      RUNNER_IMAGE: ${{ inputs.runner_image }}
+
+    steps:
+      - name: Checkout fork dev branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          token: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+          fetch-depth: 0
+          ref: dev
+
+      - name: Configure git
+        run: |
+          git config user.name  "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+
+      - name: Guard — thoughts.md updated in latest commit
+        run: |
+          if ! git log --name-only --pretty="" -3 HEAD | grep -q "audit_logs/thoughts.md"; then
+            echo "ERROR: audit_logs/thoughts.md was not modified in the last 3 commits."
+            echo "Update thoughts.md with your reasoning before issuing /run-backtest."
+            exit 1
+          fi
+
+      - name: Compute run_id
+        id: run_id
+        run: |
+          RUN_ID="$(date -u +%Y-%m-%d)-$(git rev-parse --short HEAD)"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "strategy_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore canonical test_runner.py
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/fxquantbench/model-template/main/test_runner.py \
+            -o test_runner.py
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: benchmark-bot
+          password: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+      - name: Resolve strategy runner image
+        run: |
+          REQUESTED_IMAGE="$RUNNER_IMAGE"
+          if docker pull "$REQUESTED_IMAGE"; then
+            exit 0
+          fi
+
+          echo "WARNING: Unable to pull $REQUESTED_IMAGE from GHCR."
+          echo "Private GHCR pulls require Manage Actions access on the strategy-runner package."
+
+          if [[ "$REQUESTED_IMAGE" != ghcr.io/fxquantbench/strategy-runner* ]]; then
+            echo "ERROR: $REQUESTED_IMAGE is not the infra-managed strategy-runner image, so no local build fallback is available."
+            exit 1
+          fi
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          echo "Falling back to a local build from fxquantbench/infra."
+          gh repo clone fxquantbench/infra "$TMP_DIR/infra" -- --depth=1
+
+          LOCAL_RUNNER_IMAGE="strategy-runner-local:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build \
+            -t "$LOCAL_RUNNER_IMAGE" \
+            -f "$TMP_DIR/infra/docker/Dockerfile.strategy" \
+            "$TMP_DIR/infra"
+
+          echo "RUNNER_IMAGE=$LOCAL_RUNNER_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Compute in-sample cache metadata
+        id: insample_cache_metadata
+        run: |
+          STAGE_DIR="$RUNNER_TEMP/insample_input"
+          mkdir -p "$STAGE_DIR"
+          echo "stage_dir=$STAGE_DIR" >> "$GITHUB_OUTPUT"
+          echo "cache_key=${{ env.INSAMPLE_CACHE_NAMESPACE }}-${{ runner.os }}-${{ inputs.in_sample_start }}-${{ inputs.in_sample_end }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore in-sample shard cache
+        id: restore_insample_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+          key: ${{ steps.insample_cache_metadata.outputs.cache_key }}
+
+      - name: Verify staged in-sample shards
+        id: verify_insample_cache
+        env:
+          HF_TOKEN_RO: ${{ secrets.HF_TOKEN_RO }}
+          IN_SAMPLE_START: ${{ inputs.in_sample_start }}
+          IN_SAMPLE_END: ${{ inputs.in_sample_end }}
+          STAGE_DIR: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check huggingface_hub
+          python3 - <<'PYEOF'
+          import os
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          from huggingface_hub import HfFileSystem
+
+          start = date.fromisoformat(os.environ["IN_SAMPLE_START"])
+          end = date.fromisoformat(os.environ["IN_SAMPLE_END"])
+          stage_dir = Path(os.environ["STAGE_DIR"])
+          manifest_path = stage_dir / "manifest.txt"
+
+          expected = []
+          skipped = []
+          if manifest_path.exists():
+            expected = [
+              line.strip()
+              for line in manifest_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+            ]
+          else:
+            token = os.environ["HF_TOKEN_RO"]
+            hffs = HfFileSystem(token=token)
+            day = start
+            while day < end:
+              local_name = f"ticks_{day.isoformat()}.parquet"
+              dataset_path = (
+                "datasets/FXQuantBench/fx-ticks/"
+                f"GBPUSD/{day:%Y/%m/%d}/{local_name}"
+              )
+              if hffs.exists(dataset_path):
+                expected.append(local_name)
+              else:
+                skipped.append(day.isoformat())
+                print(
+                  f"Skipping unavailable shard day {day.isoformat()}: {dataset_path}"
+                )
+              day += timedelta(days=1)
+
+            if not expected:
+              raise RuntimeError(
+                "No in-sample parquet shards were found for the requested window."
+              )
+
+            manifest_path.write_text(
+              "".join(f"{name}\n" for name in expected),
+              encoding="utf-8",
+            )
+
+          expected_set = set(expected)
+          actual = sorted(path.name for path in stage_dir.glob("*.parquet"))
+          missing = [name for name in expected if name not in expected_set.intersection(actual)]
+          unexpected = [name for name in actual if name not in expected_set]
+          cache_complete = not missing and not unexpected
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"expected_count={len(expected)}\n")
+              fh.write(f"skipped_count={len(skipped)}\n")
+              fh.write(f"cache_complete={'true' if cache_complete else 'false'}\n")
+
+          print(
+              f"Staged shard check: expected={len(expected)} actual={len(actual)} "
+              f"missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}"
+          )
+          for name in missing:
+              print(f"Missing shard: {name}")
+          for name in unexpected:
+              print(f"Unexpected shard: {name}")
+          PYEOF
+
+      - name: Stage in-sample shards locally
+        if: steps.verify_insample_cache.outputs.cache_complete != 'true'
+        env:
+          HF_TOKEN_RO: ${{ secrets.HF_TOKEN_RO }}
+          STAGE_DIR: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import shutil
+          from datetime import date
+          from pathlib import Path
+
+          from huggingface_hub import hf_hub_download
+
+          stage_dir = Path(os.environ["STAGE_DIR"])
+          stage_dir.mkdir(parents=True, exist_ok=True)
+          manifest_path = stage_dir / "manifest.txt"
+
+          if not manifest_path.exists():
+            raise RuntimeError(
+              "Expected manifest.txt describing available in-sample shards."
+            )
+
+          expected_names = [
+            line.strip()
+            for line in manifest_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+          ]
+          if not expected_names:
+            raise RuntimeError(
+              "No in-sample parquet shards were resolved for the requested window."
+            )
+
+          expected = {}
+          for local_name in expected_names:
+            day = date.fromisoformat(
+              local_name.removeprefix("ticks_").removesuffix(".parquet")
+            )
+            expected[local_name] = f"GBPUSD/{day:%Y/%m/%d}/{local_name}"
+
+          for path in stage_dir.glob("*.parquet"):
+              if path.name not in expected:
+                  path.unlink()
+                  print(f"Removed unexpected shard {path.name}")
+
+          token = os.environ["HF_TOKEN_RO"]
+          if expected and not token:
+              raise RuntimeError("HF_TOKEN_RO is required to stage in-sample shards.")
+
+          downloaded = 0
+          for local_name, repo_filename in expected.items():
+              target_path = stage_dir / local_name
+              if target_path.exists():
+                  continue
+              cached_path = Path(
+                  hf_hub_download(
+                      repo_id="FXQuantBench/fx-ticks",
+                      repo_type="dataset",
+                      filename=repo_filename,
+                      token=token,
+                  )
+              )
+              shutil.copyfile(cached_path, target_path)
+              print(f"Staged {repo_filename} -> {target_path}")
+              downloaded += 1
+
+          manifest_path = stage_dir / "manifest.txt"
+          manifest_path.write_text(
+              "".join(f"{name}\n" for name in sorted(expected)),
+              encoding="utf-8",
+          )
+          print(
+              f"Ready: expected={len(expected)} downloaded={downloaded} stage_dir={stage_dir}"
+          )
+          PYEOF
+          chmod -R a+rX "$STAGE_DIR"
+          ls -lah "$STAGE_DIR"
+
+      - name: Save in-sample shard cache
+        if: steps.restore_insample_cache.outputs.cache-hit != 'true' && steps.verify_insample_cache.outputs.expected_count != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+          key: ${{ steps.insample_cache_metadata.outputs.cache_key }}
+
+      - name: Write in-sample stage summary
+        env:
+          CACHE_COMPLETE: ${{ steps.verify_insample_cache.outputs.cache_complete }}
+          CACHE_HIT: ${{ steps.restore_insample_cache.outputs.cache-hit }}
+          EXPECTED_COUNT: ${{ steps.verify_insample_cache.outputs.expected_count }}
+          SKIPPED_COUNT: ${{ steps.verify_insample_cache.outputs.skipped_count }}
+          STAGE_DIR: ${{ steps.insample_cache_metadata.outputs.stage_dir }}
+        run: |
+          SHARD_COUNT=$(find "$STAGE_DIR" -maxdepth 1 -name '*.parquet' | wc -l | tr -d ' ')
+          CACHE_HIT_VALUE="${CACHE_HIT:-false}"
+          CACHE_COMPLETE_VALUE="${CACHE_COMPLETE:-false}"
+          SKIPPED_COUNT_VALUE="${SKIPPED_COUNT:-0}"
+          echo "In-sample shard stage: cache_hit=${CACHE_HIT_VALUE} shard_count=${SHARD_COUNT}/${EXPECTED_COUNT} skipped_missing_days=${SKIPPED_COUNT_VALUE} cache_complete=${CACHE_COMPLETE_VALUE}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── NEW: prepare backtest_output directory ──────────────────────────
+      - name: Prepare backtest output directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/backtest_output"
+          chmod 0777 "$RUNNER_TEMP/backtest_output"
+
+      - name: Run backtest container
+        id: run_backtest
+        run: |
+          docker run \
+            --memory=12g \
+            --cpus=4 \
+            --rm \
+            --workdir /output \
+            -e MODE=backtest \
+            -e HF_TOKEN="${{ secrets.HF_TOKEN_RO }}" \
+            -e START_DATE="${{ inputs.in_sample_start }}" \
+            -e END_DATE="${{ inputs.in_sample_end }}" \
+            -e RUN_ID="${{ steps.run_id.outputs.run_id }}" \
+            -e MODEL_ID="${{ inputs.model_id }}" \
+            -e OUTPUT_DIR="/output" \
+            -e STRATEGY_SHA="${{ steps.run_id.outputs.strategy_sha }}" \
+            -e TICK_DATA_GLOB="/input/*.parquet" \
+            -e BACKTEST_LOG_OUTPUT="/output/backtest.log" \
+            -v "$GITHUB_WORKSPACE:/sandbox:ro" \
+            -v "${{ steps.insample_cache_metadata.outputs.stage_dir }}:/input:ro" \
+            -v "$RUNNER_TEMP/backtest_output:/output" \
+            "$RUNNER_IMAGE" \
+            python /sandbox/test_runner.py
+
+          if [ ! -f "$RUNNER_TEMP/backtest_output/result.json" ]; then
+            echo "ERROR: backtest runner completed without writing /output/result.json."
+            exit 1
+          fi
+
+          cp "$RUNNER_TEMP/backtest_output/result.json" "$GITHUB_WORKSPACE/result.json"
+
+      # ── NEW: capture failure log ─────────────────────────────────────────
+      - name: Capture backtest failure log
+        if: failure() && steps.run_backtest.outcome == 'failure'
+        run: |
+          LOG="$RUNNER_TEMP/backtest_output/backtest.log"
+          sudo chown "$USER" "$LOG" 2>/dev/null || true
+          LOG_SIZE=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+          if [ "$LOG_SIZE" -lt 10 ]; then
+            printf '%s\n' \
+              "ERROR exit=137: OOM kill — container exceeded 12 GB memory limit." \
+              "Use aggregated DuckDB queries. Avoid SELECT * FROM GBPUSD into pandas." \
+              "Prefer GROUP BY/LIMIT queries. Call gc.collect() after large DataFrames." \
+              > "$LOG"
+          fi
+
+      # ── NEW: truncate log to 5 MB ────────────────────────────────────────
+      - name: Truncate backtest log to 5 MB
+        if: always()
+        run: |
+          LOG_PATH="$RUNNER_TEMP/backtest_output/backtest.log"
+          if [ ! -f "$LOG_PATH" ]; then
+            exit 0
+          fi
+          MAX_BYTES=$(( 5 * 1024 * 1024 ))
+          SIZE=$(stat -c%s "$LOG_PATH" 2>/dev/null || echo 0)
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            truncate -s "$MAX_BYTES" "$LOG_PATH"
+            echo "" >> "$LOG_PATH"
+            echo "[output truncated at 5 MB]" >> "$LOG_PATH"
+          fi
+
+      # ── NEW: copy log into repo folder ───────────────────────────────────
+      - name: Copy log to backtest_results/
+        if: always()
+        run: |
+          LOG_PATH="$RUNNER_TEMP/backtest_output/backtest.log"
+          if [ ! -f "$LOG_PATH" ]; then
+            exit 0
+          fi
+          mkdir -p backtest_results
+          cp "$LOG_PATH" "backtest_results/${{ steps.run_id.outputs.run_id }}.log"
+
+      - name: Validate result.json
+        run: |
+          pip install --quiet pydantic
+          python3 - <<'PYEOF'
+          import json, math, sys
+          from pydantic import BaseModel, field_validator
+
+          class ResultSchema(BaseModel):
+              run_id: str
+              mode: str
+              model_id: str
+              strategy_sha: str
+              start_date: str
+              end_date: str
+              sharpe: float
+              max_drawdown: float
+              win_rate: float
+              calmar_ratio: float
+              annualized_return: float
+              volatility: float
+              total_trades: int
+              avg_spread_cost_pips: float
+              runtime_seconds: float
+              completed_at: str
+              timed_out: bool
+
+              @field_validator("sharpe", "max_drawdown", "win_rate", "calmar_ratio",
+                               "annualized_return", "volatility", "avg_spread_cost_pips",
+                               "runtime_seconds")
+              @classmethod
+              def no_nan_inf(cls, v):
+                  if math.isnan(v) or math.isinf(v):
+                      return 0.0
+                  return v
+
+          with open("result.json") as f:
+              data = json.load(f)
+          result = ResultSchema(**data)
+          if result.timed_out:
+              print("WARNING: backtest timed out.", file=sys.stderr)
+          print(f"Validated: sharpe={result.sharpe:.4f} mdd={result.max_drawdown:.4f} win_rate={result.win_rate:.4f}")
+          PYEOF
+
+      - name: Commit result to leaderboard
+        run: |
+          RUN_ID="${{ steps.run_id.outputs.run_id }}"
+          MODEL_ID="${{ inputs.model_id }}"
+            DEST_PATH="model_results/${MODEL_ID}/results/backtest/${RUN_ID}.json"
+
+          git clone \
+            --depth=1 \
+            "https://x-access-token:${{ secrets.BENCHMARK_BOT_TOKEN }}@github.com/fxquantbench/leaderboard.git" \
+            /tmp/leaderboard
+
+          mkdir -p "/tmp/leaderboard/$(dirname "$DEST_PATH")"
+          cp result.json "/tmp/leaderboard/${DEST_PATH}"
+
+          cd /tmp/leaderboard
+          git config user.name  "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+          git add "$DEST_PATH"
+          git commit -m "backtest: ${MODEL_ID} ${RUN_ID}"
+          git push origin HEAD
+
+      - name: Print backtest summary
+        run: |
+          python3 - <<PYEOF
+          import json
+          with open("result.json") as f:
+              d = json.load(f)
+          print(f"run_id={d['run_id']} sharpe={d['sharpe']:.4f} mdd={d['max_drawdown']:.4f} win_rate={d['win_rate']:.4f}")
+          PYEOF
+
+      - name: Write job summary
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          with open("result.json") as f:
+              d = json.load(f)
+          summary = f"""## Backtest Result — {d['run_id']}
+
+          | Metric | Value |
+          |---|---|
+          | Run ID | `{d['run_id']}` |
+          | Mode | {d['mode']} |
+          | Model ID | {d['model_id']} |
+          | Strategy SHA | `{d['strategy_sha'][:12]}` |
+          | Start Date | {d['start_date']} |
+          | End Date | {d['end_date']} |
+          | Sharpe | {d['sharpe']:.4f} |
+          | Max Drawdown | {d['max_drawdown']:.4f} |
+          | Win Rate | {d['win_rate']:.4f} |
+          | Calmar Ratio | {d['calmar_ratio']:.4f} |
+          | Annualized Return | {d['annualized_return']:.4f} |
+          | Volatility | {d['volatility']:.4f} |
+          | Total Trades | {d['total_trades']} |
+          | Avg Spread Cost (pips) | {d['avg_spread_cost_pips']:.4f} |
+          | Runtime (s) | {d['runtime_seconds']:.1f} |
+          | Completed At | {d['completed_at']} |
+          | Timed Out | {d['timed_out']} |
+          """
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary)
+          PYEOF
+
+          - name: Archive old backtest artifacts when threshold is reached
+          if: always()
+          run: |
+            python3 - <<'PYEOF'
+            import os
+            from pathlib import Path
+            import shutil
+
+            threshold = int(os.environ.get("ARTIFACT_ARCHIVE_THRESHOLD", "30"))
+            results = Path("backtest_results")
+            archive = results / "archive"
+            logs = sorted(results.glob("*.log"), key=lambda path: path.name)
+
+            if len(logs) < threshold:
+              raise SystemExit(0)
+
+            archive.mkdir(parents=True, exist_ok=True)
+            for log in logs[: len(logs) - 10]:
+              shutil.move(str(log), str(archive / log.name))
+              print(f"Archived: {log.name}")
+            PYEOF
+
+      # ── UPDATED: always commit backtest_results/ + releases.md ──────────
+      - name: Commit backtest_results/ and releases.md and push
+        if: always()
+        run: |
+          mkdir -p backtest_results
+          git add backtest_results/ || true
+          git add releases.md || true
+          git diff --cached --quiet && echo "No changes." || \
+            git commit -m "backtest: ${{ steps.run_id.outputs.run_id }}"
+          git push origin dev

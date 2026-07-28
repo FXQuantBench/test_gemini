@@ -1,0 +1,181 @@
+name: PR Guard
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check 1 — strategy.py is valid Python
+        run: |
+          python3 -c "
+          import ast, sys
+          try:
+              ast.parse(open('strategy.py').read())
+          except SyntaxError as e:
+              print(f'FAIL: strategy.py has a syntax error: {e}', file=sys.stderr)
+              sys.exit(1)
+          print('PASS: strategy.py is valid Python.')
+          "
+
+      - name: Check 2 — strategy.py has run(conn, start_date, end_date)
+        run: |
+          python3 - <<'PYEOF'
+          import ast, sys
+
+          with open("strategy.py") as f:
+              tree = ast.parse(f.read())
+
+          found = False
+          for node in ast.walk(tree):
+              if (
+                  isinstance(node, ast.FunctionDef)
+                  and node.name == "run"
+                  # Must be top-level: col_offset == 0
+                  and node.col_offset == 0
+              ):
+                  args = [a.arg for a in node.args.args]
+                  if args == ["conn", "start_date", "end_date"]:
+                      found = True
+                      break
+
+          if not found:
+              print(
+                  "FAIL: strategy.py does not have a top-level function "
+                  "run(conn, start_date, end_date).",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print("PASS: run(conn, start_date, end_date) found.")
+          PYEOF
+
+      - name: Check 3 — thoughts.md contains current branch name
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          if ! grep -qF "$BRANCH" audit_logs/thoughts.md; then
+            echo "FAIL: audit_logs/thoughts.md does not contain the branch name '${BRANCH}'." >&2
+            echo "Add an entry referencing this branch before opening a PR." >&2
+            exit 1
+          fi
+          echo "PASS: branch name '${BRANCH}' found in thoughts.md."
+
+      - name: Check 4 — releases.md has a new [vN] entry since last merge
+        run: |
+          python3 - <<'PYEOF'
+          import subprocess, sys, re
+          from datetime import datetime, timezone
+
+          # Find last [vN] entry timestamp via git log on releases.md
+          log = subprocess.run(
+              ["git", "log", "--follow", "--format=%ci", "--", "releases.md"],
+              capture_output=True, text=True
+          ).stdout.strip().splitlines()
+
+          if not log:
+              print("FAIL: releases.md has no git history.", file=sys.stderr)
+              sys.exit(1)
+
+          # Latest commit touching releases.md
+          latest_releases_commit = datetime.fromisoformat(log[0].strip())
+
+          # Last merge commit into main
+          merge_log = subprocess.run(
+              ["git", "log", "origin/main", "--merges", "-1", "--format=%ci"],
+              capture_output=True, text=True
+          ).stdout.strip()
+
+          if merge_log:
+              last_merge = datetime.fromisoformat(merge_log.strip())
+              if latest_releases_commit <= last_merge:
+                  print(
+                      f"FAIL: releases.md was last updated {latest_releases_commit.isoformat()} "
+                      f"which is not newer than the last merge to main ({last_merge.isoformat()}).",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+          # Also verify a [vN] entry exists
+          content = open("releases.md").read()
+          if not re.search(r"^## \[v\d+\]", content, re.MULTILINE):
+              print("FAIL: releases.md has no '## [vN]' entry.", file=sys.stderr)
+              sys.exit(1)
+
+          print("PASS: releases.md has a new [vN] entry.")
+          PYEOF
+
+      - name: Check 5 — matching backtest result exists in leaderboard
+        id: check_backtest
+        run: |
+          SHA="${{ github.event.pull_request.head.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          MODEL_ID="${{ vars.MODEL_ID }}"
+
+          MATCH=$(gh api \
+            "repos/fxquantbench/leaderboard/contents/${MODEL_ID}/results/backtest" \
+            --jq ".[] | select(.name | contains(\"${SHORT_SHA}\")) | .name" \
+            2>/dev/null || echo "")
+
+          if [ -z "$MATCH" ]; then
+            echo "FAIL: No backtest result found for SHA ${SHORT_SHA} in leaderboard/${MODEL_ID}/results/backtest/." >&2
+            echo "Run /run-backtest from the dev branch before opening a PR." >&2
+            exit 1
+          fi
+
+          echo "PASS: Found backtest result: $MATCH"
+          echo "result_name=$MATCH" >> "$GITHUB_OUTPUT"
+
+      - name: Check 6 — backtest Sharpe > -10.0 and strategy_sha matches HEAD
+        run: |
+          MODEL_ID="${{ vars.MODEL_ID }}"
+          RESULT_NAME="${{ steps.check_backtest.outputs.result_name }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          DOWNLOAD_URL=$(gh api \
+            "repos/fxquantbench/leaderboard/contents/${MODEL_ID}/results/backtest/${RESULT_NAME}" \
+            --jq '.download_url' 2>/dev/null || echo "")
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "FAIL: Could not get download URL for ${RESULT_NAME}." >&2
+            exit 1
+          fi
+
+          curl -sf "$DOWNLOAD_URL" > /tmp/backtest_result.json
+
+          python3 - <<PYEOF
+          import json, sys
+
+          with open("/tmp/backtest_result.json") as f:
+              d = json.load(f)
+
+          head_sha = "$HEAD_SHA"
+          result_sha = d.get("strategy_sha", "")
+          if result_sha != head_sha:
+              print(
+                  f"FAIL: strategy_sha in result ({result_sha[:12]!r}) does not match "
+                  f"PR HEAD ({head_sha[:12]!r}). Run /run-backtest from the current dev HEAD.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          sharpe = float(d["sharpe"])
+          if sharpe <= -10.0:
+              print(f"FAIL: Backtest Sharpe is {sharpe:.4f}, which is <= -10.0.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"PASS: strategy_sha matches HEAD. Sharpe is {sharpe:.4f} (> -10.0).")
+          PYEOF

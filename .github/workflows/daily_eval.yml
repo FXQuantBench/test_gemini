@@ -1,0 +1,47 @@
+name: Daily Eval
+
+on:
+  schedule:
+    - cron: '30 8 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      eval_date:
+        description: "Override eval date (YYYY-MM-DD). Defaults to yesterday."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+
+concurrency:
+  group: model-eval-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    if: github.ref == 'refs/heads/main'
+    uses: fxquantbench/model-template/.github/workflows/_daily_eval.yml@main
+    secrets: inherit
+    with:
+      repo: ${{ github.repository }}
+      model_id: ${{ vars.MODEL_ID }}
+      eval_date: ${{ inputs.eval_date || '' }}
+      runner_image: ${{ vars.STRATEGY_RUNNER_IMAGE || 'ghcr.io/fxquantbench/strategy-runner:latest' }}
+
+  resume_loop:
+    if: ${{ needs.eval.result == 'success' && needs.eval.outputs.resume_loop == 'true' }}
+    needs: eval
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resume agent loop after eval
+        run: |
+          gh workflow run agentic_loop.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f trigger_source=daily_eval \
+            -f trigger_details="eval_date=${{ needs.eval.outputs.eval_date }}"
+

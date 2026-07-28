@@ -1,0 +1,32 @@
+name: Run Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+  actions: write
+
+jobs:
+  backtest:
+    uses: fxquantbench/model-template/.github/workflows/_run_backtest.yml@main
+    secrets: inherit
+    with:
+      repo: ${{ github.repository }}
+      model_id: ${{ vars.MODEL_ID }}
+      in_sample_start: '2025-01-01'
+      in_sample_end: '2026-06-01'
+      artifact_archive_threshold: ${{ vars.ARTIFACT_ARCHIVE_THRESHOLD || '30' }}
+      runner_image: ${{ vars.STRATEGY_RUNNER_IMAGE || 'ghcr.io/fxquantbench/strategy-runner:latest' }}
+
+  resume_loop:
+    if: ${{ always() && needs.backtest.result != 'cancelled' }}
+    needs: backtest
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resume agent loop
+        run: |
+          gh workflow run agentic_loop.yml --repo "${{ github.repository }}" --ref main

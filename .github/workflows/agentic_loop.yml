@@ -1,0 +1,455 @@
+name: Agentic Loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      trigger_source:
+        description: "Optional workflow or actor that resumed the loop"
+        required: false
+        type: string
+      trigger_details:
+        description: "Optional extra detail about the loop trigger"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: agentic-loop-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    env:
+      MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      MODEL_ID: ${{ vars.MODEL_ID }}
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+      MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+      MAX_DAILY_ITERATIONS: ${{ vars.MAX_DAILY_ITERATIONS || '50' }}
+      GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Switch to dev branch
+        run: |
+          git config user.name  "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+          git checkout dev 2>/dev/null || git checkout -b dev
+          git pull origin dev --rebase 2>/dev/null || true
+          git push origin dev 2>/dev/null || true
+
+      - name: Read loop state
+        id: state
+        run: |
+          STATE=$(cat .github/loop_state.json)
+          LAST_RUN=$(echo "$STATE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('last_run') or '')")
+          DAILY_COUNT=$(echo "$STATE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('daily_count', 0))")
+          COUNT_DATE=$(echo "$STATE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('count_date') or '')")
+          echo "last_run=$LAST_RUN"   >> "$GITHUB_OUTPUT"
+          echo "daily_count=$DAILY_COUNT" >> "$GITHUB_OUTPUT"
+          echo "count_date=$COUNT_DATE"   >> "$GITHUB_OUTPUT"
+
+      - name: Guard — too soon
+        run: |
+          if [ "${{ github.actor }}" = "github-actions[bot]" ]; then
+            echo "Skipping too-soon guard for workflow-dispatched continuation."
+            exit 0
+          fi
+          LAST_RUN="${{ steps.state.outputs.last_run }}"
+          if [ -n "$LAST_RUN" ]; then
+            DELTA=$(python3 -c "
+          from datetime import datetime, timezone
+          last = datetime.fromisoformat('$LAST_RUN')
+          now  = datetime.now(timezone.utc)
+          print(int((now - last).total_seconds()))
+          ")
+            if [ "$DELTA" -lt 1800 ]; then
+              echo "Exiting: too soon — last run was ${DELTA}s ago (min 1800s)."
+              echo "SKIP_JOB=true" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Guard — daily cap
+        if: env.SKIP_JOB != 'true'
+        run: |
+          TODAY=$(python3 -c "from datetime import date; print(date.today().isoformat())")
+          COUNT_DATE="${{ steps.state.outputs.count_date }}"
+          DAILY_COUNT="${{ steps.state.outputs.daily_count }}"
+          MAX="${{ env.MAX_DAILY_ITERATIONS }}"
+
+          if [ "$COUNT_DATE" != "$TODAY" ]; then
+            DAILY_COUNT=0
+          fi
+
+          if [ "$DAILY_COUNT" -ge "$MAX" ]; then
+            echo "Exiting: daily cap reached (${DAILY_COUNT}/${MAX})."
+            echo "SKIP_JOB=true" >> "$GITHUB_ENV"
+          fi
+
+          # Export adjusted count for later steps
+          echo "ADJUSTED_COUNT=$DAILY_COUNT" >> "$GITHUB_ENV"
+          echo "TODAY=$TODAY" >> "$GITHUB_ENV"
+
+      - name: Fetch latest leaderboard summaries
+        if: env.SKIP_JOB != 'true'
+        id: leaderboard
+        run: |
+          fetch_summaries() {
+            RESULT_TYPE="$1"
+            SUMMARIES=""
+            if [ -n "${{ vars.MODEL_ID }}" ]; then
+              RAW=$(gh api "repos/fxquantbench/leaderboard/contents/model_results/${{ vars.MODEL_ID }}/results/${RESULT_TYPE}" \
+                --jq 'sort_by(.name) | reverse | .[0:3] | .[].download_url' 2>/dev/null || echo "")
+              if [ -n "$RAW" ]; then
+                while IFS= read -r URL; do
+                  if [ -n "$URL" ]; then
+                    DATA=$(curl -sf "$URL" 2>/dev/null || echo "{}")
+                    SUMMARY=$(echo "$DATA" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          print(f\"run_id={d.get('run_id','?')} mode={d.get('mode','?')} sharpe={d.get('sharpe','?')} mdd={d.get('max_drawdown','?')} win_rate={d.get('win_rate','?')}\")
+          " 2>/dev/null || echo "$DATA")
+                    SUMMARIES="${SUMMARIES}${SUMMARY}"$'\n'
+                  fi
+                done <<< "$RAW"
+              fi
+            fi
+            printf '%s' "$SUMMARIES"
+          }
+
+          BACKTEST_SUMMARIES=$(fetch_summaries backtest)
+          EVAL_SUMMARIES=$(fetch_summaries eval)
+
+          echo "backtest_summaries<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BACKTEST_SUMMARIES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "eval_summaries<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$EVAL_SUMMARIES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Read latest backtest failure log
+        if: env.SKIP_JOB != 'true'
+        id: backtest_log
+        run: |
+          LATEST_LOG=$(ls -t backtest_results/*.log 2>/dev/null | head -1 || echo "")
+          if [ -n "$LATEST_LOG" ]; then
+            echo "path=$LATEST_LOG" >> "$GITHUB_OUTPUT"
+            CONTENT=$(tail -100 "$LATEST_LOG")
+            echo "content<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$CONTENT" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "content=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build context file
+        if: env.SKIP_JOB != 'true'
+        env:
+          TRIGGER_DETAILS: ${{ github.event.inputs.trigger_details || '' }}
+          TRIGGER_SOURCE: ${{ github.event.inputs.trigger_source || '' }}
+        run: |
+          if [ -n "$TRIGGER_SOURCE" ]; then
+            TRIGGER_INFO="Trigger: child workflow ${TRIGGER_SOURCE}"
+            if [ -n "$TRIGGER_DETAILS" ]; then
+              TRIGGER_INFO="${TRIGGER_INFO} (${TRIGGER_DETAILS})"
+            fi
+          elif [ "${{ github.actor }}" = "github-actions[bot]" ]; then
+            TRIGGER_INFO="Trigger: workflow_dispatch from child workflow"
+          else
+            TRIGGER_INFO="Trigger: manual workflow_dispatch"
+          fi
+
+          {
+            cat prompt_context.md
+            echo ""
+            echo "---USER---"
+            echo ""
+            echo "## Current research_summary.md"
+            echo ""
+            cat research_summary.md
+            echo ""
+            echo "## Current releases.md"
+            echo ""
+            cat releases.md
+            echo ""
+            echo "## Last 100 lines of audit_logs/thoughts.md"
+            echo ""
+            tail -100 audit_logs/thoughts.md
+            echo ""
+            echo "## Last 3 backtest summaries"
+            echo ""
+            echo "${{ steps.leaderboard.outputs.backtest_summaries }}"
+            echo ""
+            echo "## Last 3 eval summaries"
+            echo ""
+            echo "${{ steps.leaderboard.outputs.eval_summaries }}"
+            echo ""
+            if [ -n "${{ steps.backtest_log.outputs.path }}" ]; then
+              echo "## Latest backtest failure log (${{ steps.backtest_log.outputs.path }})"
+              echo ""
+              echo "${{ steps.backtest_log.outputs.content }}"
+              echo ""
+            fi
+            echo "## Trigger"
+            echo ""
+            echo "$TRIGGER_INFO"
+          } > /tmp/context.md
+
+      - name: Install provider libraries
+        if: env.SKIP_JOB != 'true'
+        run: pip install --quiet -r requirements.txt
+
+      - name: Call model
+        if: env.SKIP_JOB != 'true'
+        run: |
+          mkdir -p /tmp/llm_log
+          cp /tmp/context.md /tmp/llm_log/prompt_and_response.txt
+          python harness/call_model.py --context-file /tmp/context.md > /tmp/response.json
+          echo "" >> /tmp/llm_log/prompt_and_response.txt
+          cat /tmp/response.json >> /tmp/llm_log/prompt_and_response.txt
+
+      - name: Upload LLM prompt and response
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-call-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/llm_log/prompt_and_response.txt
+          retention-days: 14
+
+      - name: Append thoughts to audit_logs/thoughts.md
+        if: env.SKIP_JOB != 'true'
+        run: |
+          TIMESTAMP=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))")
+          if [ "${{ github.actor }}" = "github-actions[bot]" ]; then
+            LABEL="workflow_dispatch-resume"
+          else
+            LABEL="workflow_dispatch"
+          fi
+          THOUGHTS=$(python3 -c "import json; d=json.load(open('/tmp/response.json')); print(d['thoughts'])")
+          {
+            echo ""
+            echo "## ${TIMESTAMP} — ${LABEL}"
+            echo ""
+            echo "$THOUGHTS"
+          } >> audit_logs/thoughts.md
+
+      - name: Apply file changes
+        if: env.SKIP_JOB != 'true'
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, pathlib, sys
+
+          PROTECTED = {
+              "audit_logs/thoughts.md",
+              "prompt_context.md",
+              "releases.md",
+              "research_summary.md",
+              "test_runner.py",
+          }
+
+          with open("/tmp/response.json") as f:
+              response = json.load(f)
+
+          skipped = []
+          for change in response.get("file_changes", []):
+              path = change.get("path", "").strip()
+              content = change.get("content", "")
+              if not path:
+                  continue
+              # Normalise and guard against path traversal
+              norm = pathlib.PurePosixPath(path).as_posix().lstrip("/")
+              if norm in PROTECTED:
+                  skipped.append(norm)
+                  print(f"SKIP (protected): {norm}", file=sys.stderr)
+                  continue
+              target = pathlib.Path(norm)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(content, encoding="utf-8")
+              print(f"WROTE: {norm}")
+
+          if skipped:
+              print(f"Skipped protected files: {skipped}", file=sys.stderr)
+          PYEOF
+
+          - name: Apply structured record updates
+          if: env.SKIP_JOB != 'true'
+          run: |
+            python3 - <<'PYEOF'
+            import json
+            import re
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            with open("/tmp/response.json", encoding="utf-8") as response_file:
+              response = json.load(response_file)
+
+            updates = response.get("record_updates", {})
+            commands = response.get("commands", [])
+            submitting_pr = any(command.strip() == "/submit-pr" for command in commands)
+
+            def utc_timestamp() -> str:
+              return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+            def update_research_summary() -> None:
+              research_updates = updates.get("research_updates", [])
+              if not research_updates:
+                return
+
+              path = Path("research_summary.md")
+              lines = path.read_text(encoding="utf-8").splitlines()
+              updates_by_id = {update["id"]: update for update in research_updates}
+              seen = set()
+              rewritten = []
+
+              for line in lines:
+                match = re.match(r"^\|\s*([^|]+?)\s*\|", line)
+                if not match or match.group(1).strip() not in updates_by_id:
+                  rewritten.append(line)
+                  continue
+
+                record_id = match.group(1).strip()
+                cells = [cell.strip() for cell in line.split("|")[1:-1]]
+                if len(cells) != 5:
+                  raise ValueError(f"Malformed research summary row for {record_id!r}.")
+                update = updates_by_id[record_id]
+                if "hypothesis" in update:
+                  cells[2] = update["hypothesis"].replace("|", "\\|")
+                if "verdict" in update:
+                  cells[4] = update["verdict"].replace("|", "\\|")
+                rewritten.append("| " + " | ".join(cells) + " |")
+                seen.add(record_id)
+
+              for record_id, update in updates_by_id.items():
+                if record_id in seen:
+                  continue
+                if "hypothesis" not in update:
+                  raise ValueError(
+                    f"Research update for unknown ID {record_id!r} needs a hypothesis."
+                  )
+                hypothesis = update["hypothesis"].replace("|", "\\|")
+                rewritten.append(
+                  f"| {record_id} | {datetime.now(timezone.utc).date().isoformat()} | "
+                  f"{hypothesis} |  |  |"
+                )
+
+              path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+            def append_release_note() -> None:
+              if not submitting_pr:
+                return
+              note = updates.get("release_note", "").strip()
+              if not note:
+                raise ValueError("A /submit-pr command requires record_updates.release_note.")
+
+              path = Path("releases.md")
+              content = path.read_text(encoding="utf-8")
+              versions = [int(value) for value in re.findall(r"^## \[v(\d+)\]", content, re.MULTILINE)]
+              next_version = max(versions, default=-1) + 1
+              with path.open("a", encoding="utf-8") as releases_file:
+                releases_file.write(
+                  f"\n## [v{next_version}] - {utc_timestamp()}\n\n{note}\n"
+                )
+
+            update_research_summary()
+            append_release_note()
+            PYEOF
+
+      - name: Commit all changes
+        if: env.SKIP_JOB != 'true'
+        run: |
+          NOW=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())")
+          NEW_COUNT=$(( ADJUSTED_COUNT + 1 ))
+          python3 -c "
+          import json
+          state = {'last_run': '$NOW', 'daily_count': $NEW_COUNT, 'count_date': '$TODAY'}
+          print(json.dumps(state, indent=2))
+          " > .github/loop_state.json
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit." || \
+            git commit -m "chore: agentic loop iteration [skip ci]"
+          git push origin dev
+
+      - name: Process first valid command
+        if: env.SKIP_JOB != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event.inputs.trigger_source || '' }}" = "catch_up_eval" ]; then
+            echo "Catch-up reflection complete; scheduling the next catch-up date."
+            gh workflow run catch_up_eval.yml \
+              --repo "${{ github.repository }}" \
+              --ref main \
+              -f resume_after_reflection=true
+            exit 0
+          fi
+
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          with open("/tmp/response.json") as f:
+              response = json.load(f)
+
+          commands = response.get("commands", [])
+
+          for cmd in commands:
+              cmd = cmd.strip()
+              if cmd.startswith("/run-eda "):
+                  file_id = cmd.split(" ", 1)[1].strip()
+                  print(f"Dispatching run_eda.yml with file_id={file_id}")
+                  result = subprocess.run(
+                      ["gh", "workflow", "run", "run_eda.yml",
+                       "--ref", "main",
+                       "-f", f"file_id={file_id}"],
+                      capture_output=True, text=True
+                  )
+                  print(result.stdout)
+                  if result.returncode != 0:
+                      print(result.stderr, file=sys.stderr)
+                      sys.exit(result.returncode)
+                  break
+              elif cmd == "/run-backtest":
+                  print("Dispatching run_backtest.yml")
+                  result = subprocess.run(
+                      ["gh", "workflow", "run", "run_backtest.yml", "--ref", "main"],
+                      capture_output=True, text=True
+                  )
+                  print(result.stdout)
+                  if result.returncode != 0:
+                      print(result.stderr, file=sys.stderr)
+                      sys.exit(result.returncode)
+                  break
+              elif cmd == "/submit-pr":
+                  print("Opening PR from dev to main")
+                  # Read latest thoughts for PR body
+                  try:
+                      thoughts = json.load(open("/tmp/response.json"))["thoughts"]
+                  except Exception:
+                      thoughts = "Automated PR from agentic loop."
+                  result = subprocess.run(
+                      ["gh", "pr", "create",
+                       "--base", "main",
+                       "--head", "dev",
+                       "--title", "chore: agentic loop PR",
+                       "--body", thoughts],
+                      capture_output=True, text=True
+                  )
+                  print(result.stdout)
+                  # A non-zero exit here means PR already exists or another error;
+                  # log but don't fail the workflow
+                  if result.returncode != 0:
+                      print(f"gh pr create: {result.stderr}", file=sys.stderr)
+                  break
+          else:
+              print("No valid command found in response.")
+          PYEOF

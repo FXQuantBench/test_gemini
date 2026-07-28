@@ -1,0 +1,404 @@
+name: _Daily Eval (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "Caller repository (owner/repo)"
+        required: true
+        type: string
+      model_id:
+        required: true
+        type: string
+      eval_date:
+        description: "Override eval date (YYYY-MM-DD). Defaults to yesterday."
+        required: false
+        type: string
+        default: ""
+      runner_image:
+        description: "Infra-managed strategy runner image reference"
+        required: false
+        type: string
+        default: "ghcr.io/fxquantbench/strategy-runner:latest"
+    outputs:
+      eval_date:
+        description: "Resolved eval date for this run"
+        value: ${{ jobs.eval.outputs.eval_date }}
+      resume_loop:
+        description: "Whether the caller should resume the agent loop"
+        value: ${{ jobs.eval.outputs.resume_loop }}
+        result_status:
+          description: "created, already_exists, or error"
+          value: ${{ jobs.eval.outputs.result_status }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    outputs:
+      eval_date: ${{ steps.date.outputs.eval_date }}
+      resume_loop: ${{ steps.resume_gate.outputs.resume_loop }}
+      result_status: ${{ steps.result_status.outputs.result_status }}
+    env:
+      EVAL_STAGE_ISOLATION: 'ephemeral_only'
+      GH_TOKEN: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+      RUNNER_IMAGE: ${{ inputs.runner_image }}
+      SKIP_JOB: 'false'
+
+    steps:
+      - name: Checkout fork main branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          token: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+          fetch-depth: 1
+          ref: main
+
+      - name: Compute eval_date
+        id: date
+        run: |
+          if [ -n "${{ inputs.eval_date }}" ]; then
+            EVAL_DATE="${{ inputs.eval_date }}"
+          else
+            EVAL_DATE=$(python3 -c "from datetime import date, timedelta; print((date.today() - timedelta(days=1)).isoformat())")
+          fi
+          echo "eval_date=$EVAL_DATE" >> "$GITHUB_OUTPUT"
+          echo "strategy_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Eval date: $EVAL_DATE"
+          # Compute window_start and window_end.
+          # On Tuesdays EVAL_DATE is Monday; extend window back to Sunday to
+          # capture the FX weekly open session (~21:00 UTC Sunday).
+          python3 - <<PYEOF
+          from datetime import date, timedelta
+          import os
+          eval_date = date.fromisoformat("$EVAL_DATE")
+          window_end = eval_date + timedelta(days=1)
+          if eval_date.weekday() == 0:  # Monday
+              window_start = eval_date - timedelta(days=1)  # Sunday
+          else:
+              window_start = eval_date
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"window_start={window_start.isoformat()}\n")
+              fh.write(f"window_end={window_end.isoformat()}\n")
+          print(f"Window: {window_start.isoformat()} → {window_end.isoformat()} (exclusive)")
+          PYEOF
+
+      - name: Guard — idempotency check
+        run: |
+          EVAL_DATE="${{ steps.date.outputs.eval_date }}"
+          MODEL_ID="${{ inputs.model_id }}"
+          if gh api \
+            "repos/fxquantbench/leaderboard/contents/model_results/${MODEL_ID}/results/eval/${EVAL_DATE}.json" \
+            >/dev/null 2>&1; then
+            echo "Skipping: eval result for ${EVAL_DATE} already exists in leaderboard."
+            echo "SKIP_JOB=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Decide whether to resume agent loop
+        id: resume_gate
+        run: |
+          if [ "$SKIP_JOB" = 'true' ]; then
+            echo "resume_loop=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "resume_loop=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Confirm HF shards exist for eval window
+        if: env.SKIP_JOB != 'true'
+        id: shard_check
+        continue-on-error: true
+        env:
+          HF_TOKEN_RO: ${{ secrets.HF_TOKEN_RO }}
+        run: |
+          WINDOW_START="${{ steps.date.outputs.window_start }}"
+          WINDOW_END="${{ steps.date.outputs.window_end }}"
+          python3 -m pip install --quiet --disable-pip-version-check huggingface_hub pyarrow fsspec
+          python3 - <<PYEOF
+          import os, sys
+          from datetime import date, timedelta
+
+          import pyarrow.dataset as ds
+          from pyarrow import compute as pc
+          from pyarrow import fs as pafs
+          from huggingface_hub import HfApi, HfFileSystem
+
+          hf_token = os.environ["HF_TOKEN_RO"]
+          window_start = date.fromisoformat("$WINDOW_START")
+          window_end   = date.fromisoformat("$WINDOW_END")  # exclusive
+          github_output = os.environ["GITHUB_OUTPUT"]
+
+          def set_output(key: str, value: str) -> None:
+              with open(github_output, "a") as fh:
+                  fh.write(f"{key}={value}\n")
+
+          def day_parquet_path(day: date) -> str:
+              return (
+                  "datasets/FXQuantBench/fx-ticks/"
+                  f"GBPUSD/{day:%Y/%m/%d}/ticks_{day.isoformat()}.parquet"
+              )
+
+          try:
+              HfApi(token=hf_token).auth_check("FXQuantBench/fx-ticks", repo_type="dataset")
+              hffs = HfFileSystem(token=hf_token)
+              parquet_files = []
+              missing_paths = []
+              day = window_start
+              while day < window_end:
+                  parquet_path = day_parquet_path(day)
+                  if hffs.exists(parquet_path):
+                      parquet_files.append(parquet_path)
+                  else:
+                      missing_paths.append(day.isoformat())
+                      print(
+                          f"MISSING: Expected GBPUSD shard {parquet_path} was not found.",
+                          file=sys.stderr,
+                      )
+                  day += timedelta(days=1)
+              if missing_paths:
+                  set_output("status", "missing")
+                  set_output("missing_days", ",".join(missing_paths))
+                  sys.exit(1)
+              if not parquet_files:
+                  raise RuntimeError(
+                      "No parquet files found for the requested eval window under "
+                      "FXQuantBench/fx-ticks/GBPUSD."
+                  )
+              dataset = ds.dataset(
+                  parquet_files,
+                  filesystem=pafs.PyFileSystem(pafs.FSSpecHandler(hffs)),
+                  format="parquet",
+              )
+          except Exception as exc:
+              set_output("status", "error")
+              print(f"ERROR preparing HF dataset access: {exc}", file=sys.stderr)
+              sys.exit(2)
+
+          missing = []
+          day = window_start
+          while day < window_end:
+              from datetime import datetime, timezone
+              day_start_ms = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp() * 1000)
+              day_end_ms   = day_start_ms + 86_400_000
+              try:
+                  count = dataset.count_rows(
+                      filter=(
+                      (pc.field("timestamp_utc") >= day_start_ms)
+                          & (pc.field("timestamp_utc") < day_end_ms)
+                      )
+                  )
+              except Exception as exc:
+                  set_output("status", "error")
+                  print(f"ERROR querying HF dataset for {day}: {exc}", file=sys.stderr)
+                  sys.exit(2)
+              if count == 0:
+                  missing.append(day.isoformat())
+                  print(f"MISSING: No GBPUSD rows for {day} in HF dataset.", file=sys.stderr)
+              else:
+                  print(f"OK: {count} rows for {day}.")
+              day += timedelta(days=1)
+
+          if missing:
+              set_output("status", "missing")
+              set_output("missing_days", ",".join(missing))
+              sys.exit(1)
+          set_output("status", "ok")
+          PYEOF
+
+      - name: Fail on shard check error
+        if: steps.shard_check.outcome == 'failure' && steps.shard_check.outputs.status != 'missing'
+        run: |
+          echo "HF shard preflight failed unexpectedly. See the shard check logs above."
+          exit 1
+
+      - name: Open issue if shard missing
+        if: steps.shard_check.outputs.status == 'missing'
+        run: |
+          EVAL_DATE="${{ steps.date.outputs.eval_date }}"
+          WINDOW_START="${{ steps.date.outputs.window_start }}"
+          MISSING_DAYS="${{ steps.shard_check.outputs.missing_days }}"
+          gh issue create \
+            --repo "${{ inputs.repo }}" \
+            --title "Missing HF shard: ${EVAL_DATE} (window ${WINDOW_START}→${EVAL_DATE})" \
+            --body "The daily eval workflow could not find GBPUSD tick data in \`FXQuantBench/fx-ticks\` for one or more days in the window **${WINDOW_START} → ${EVAL_DATE}** (inclusive). Missing day(s): ${MISSING_DAYS}. The eval was skipped. Please verify the dataset and re-run once the shards are available." \
+            --label "data-missing" 2>/dev/null || true
+          echo "Issue opened for missing shard(s) in window ${WINDOW_START}→${EVAL_DATE}. Exiting."
+          exit 1
+
+      - name: Stage eval shards locally (ephemeral only)
+        if: env.SKIP_JOB != 'true'
+        env:
+          HF_TOKEN_RO: ${{ secrets.HF_TOKEN_RO }}
+        run: |
+          WINDOW_START="${{ steps.date.outputs.window_start }}"
+          WINDOW_END="${{ steps.date.outputs.window_end }}"
+          STAGE_DIR="$RUNNER_TEMP/eval_input"
+          echo "Eval staging is ephemeral-only; no shared cache restore/save is allowed."
+          mkdir -p "$STAGE_DIR"
+          python3 - <<PYEOF
+          import os
+          import shutil
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          from huggingface_hub import hf_hub_download
+
+          token = os.environ["HF_TOKEN_RO"]
+          window_start = date.fromisoformat("$WINDOW_START")
+          window_end = date.fromisoformat("$WINDOW_END")
+          stage_dir = Path("$STAGE_DIR")
+          stage_dir.mkdir(parents=True, exist_ok=True)
+
+          def day_filename(day: date) -> str:
+              return f"GBPUSD/{day:%Y/%m/%d}/ticks_{day.isoformat()}.parquet"
+
+          downloaded = 0
+          day = window_start
+          while day < window_end:
+              filename = day_filename(day)
+              cached_path = Path(
+                  hf_hub_download(
+                      repo_id="FXQuantBench/fx-ticks",
+                      repo_type="dataset",
+                      filename=filename,
+                      token=token,
+                  )
+              )
+              target_path = stage_dir / cached_path.name
+              shutil.copyfile(cached_path, target_path)
+              print(f"Downloaded {filename} -> {target_path}")
+              downloaded += 1
+              day += timedelta(days=1)
+
+          if downloaded == 0:
+              raise RuntimeError("No eval parquet shards were downloaded.")
+          PYEOF
+          chmod -R a+rX "$STAGE_DIR"
+          ls -lah "$STAGE_DIR"
+
+      - name: Restore canonical test_runner.py
+        if: env.SKIP_JOB != 'true'
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/fxquantbench/model-template/main/test_runner.py \
+            -o test_runner.py
+
+      - name: Log in to GHCR
+        if: env.SKIP_JOB != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: benchmark-bot
+          password: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+      - name: Resolve strategy runner image
+        if: env.SKIP_JOB != 'true'
+        run: |
+          REQUESTED_IMAGE="$RUNNER_IMAGE"
+          if docker pull "$REQUESTED_IMAGE"; then
+            exit 0
+          fi
+
+          echo "WARNING: Unable to pull $REQUESTED_IMAGE from GHCR."
+          echo "Private GHCR pulls require Manage Actions access on the strategy-runner package."
+
+          if [[ "$REQUESTED_IMAGE" != ghcr.io/fxquantbench/strategy-runner* ]]; then
+            echo "ERROR: $REQUESTED_IMAGE is not the infra-managed strategy-runner image, so no local build fallback is available."
+            exit 1
+          fi
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          echo "Falling back to a local build from fxquantbench/infra."
+          gh repo clone fxquantbench/infra "$TMP_DIR/infra" -- --depth=1
+
+          LOCAL_RUNNER_IMAGE="strategy-runner-local:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build \
+            -t "$LOCAL_RUNNER_IMAGE" \
+            -f "$TMP_DIR/infra/docker/Dockerfile.strategy" \
+            "$TMP_DIR/infra"
+
+          echo "RUNNER_IMAGE=$LOCAL_RUNNER_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Run eval container
+        if: env.SKIP_JOB != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/eval_output"
+          chmod 0777 "$RUNNER_TEMP/eval_output"
+          docker run \
+            --memory=12g \
+            --cpus=4 \
+            --rm \
+            --workdir /output \
+            -e MODE=eval \
+            -e HF_TOKEN="${{ secrets.HF_TOKEN_RO }}" \
+            -e TICK_DATA_GLOB="/input/*.parquet" \
+            -e START_DATE="${{ steps.date.outputs.window_start }}" \
+            -e END_DATE="${{ steps.date.outputs.window_end }}" \
+            -e RUN_ID="${{ steps.date.outputs.eval_date }}" \
+            -e MODEL_ID="${{ inputs.model_id }}" \
+            -e OUTPUT_DIR="/output" \
+            -e STRATEGY_SHA="${{ steps.date.outputs.strategy_sha }}" \
+            -v "$RUNNER_TEMP/eval_input:/input:ro" \
+            -v "$GITHUB_WORKSPACE:/sandbox:ro" \
+            -v "$RUNNER_TEMP/eval_output:/output" \
+            "$RUNNER_IMAGE" \
+            python /sandbox/test_runner.py
+
+          if [ ! -f "$RUNNER_TEMP/eval_output/result.json" ]; then
+            echo "ERROR: eval runner completed without writing /output/result.json."
+            exit 1
+          fi
+
+          cp "$RUNNER_TEMP/eval_output/result.json" "$GITHUB_WORKSPACE/result.json"
+
+      - name: Ensure strategy_sha is set in result.json
+        if: env.SKIP_JOB != 'true'
+        run: |
+          SHA="${{ steps.date.outputs.strategy_sha }}"
+          python3 - <<PYEOF
+          import json
+          with open("result.json") as f:
+              d = json.load(f)
+          d["strategy_sha"] = "$SHA"
+          with open("result.json", "w") as f:
+              json.dump(d, f, indent=2)
+          print(f"strategy_sha set to {d['strategy_sha']}")
+          PYEOF
+
+      - name: Commit result to leaderboard
+        if: env.SKIP_JOB != 'true'
+        run: |
+          EVAL_DATE="${{ steps.date.outputs.eval_date }}"
+          MODEL_ID="${{ inputs.model_id }}"
+            DEST_PATH="model_results/${MODEL_ID}/results/eval/${EVAL_DATE}.json"
+
+          git clone \
+            --depth=1 \
+            "https://x-access-token:${{ secrets.BENCHMARK_BOT_TOKEN }}@github.com/fxquantbench/leaderboard.git" \
+            /tmp/leaderboard
+
+          mkdir -p "/tmp/leaderboard/$(dirname "$DEST_PATH")"
+          cp result.json "/tmp/leaderboard/${DEST_PATH}"
+
+          cd /tmp/leaderboard
+          git config user.name  "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+          git add "$DEST_PATH"
+          git commit -m "eval: ${MODEL_ID} ${EVAL_DATE}"
+          git push origin HEAD
+
+      - name: Record evaluation result status
+        id: result_status
+        if: always()
+        run: |
+          if [ "$SKIP_JOB" = 'true' ]; then
+            echo "result_status=already_exists" >> "$GITHUB_OUTPUT"
+          elif [ "${{ job.status }}" = 'success' ]; then
+            echo "result_status=created" >> "$GITHUB_OUTPUT"
+          else
+            echo "result_status=error" >> "$GITHUB_OUTPUT"
+          fi

@@ -1,0 +1,202 @@
+name: Catch-Up Eval
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 0 * * *'
+  workflow_dispatch:
+    inputs:
+      resume_after_reflection:
+        description: "Continue after the model reviewed the previous catch-up result"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: read
+  actions: write
+
+concurrency:
+  group: model-eval-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      eval_date: ${{ steps.plan.outputs.eval_date }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_BEFORE: ${{ github.event.before || '' }}
+      EVENT_SHA: ${{ github.sha }}
+      MAX_DAILY_ITERATIONS: ${{ vars.MAX_DAILY_ITERATIONS || '50' }}
+      RESUME_AFTER_REFLECTION: ${{ inputs.resume_after_reflection || false }}
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+
+      - name: Plan next catch-up action
+        id: plan
+        run: |
+          git fetch origin dev:refs/remotes/origin/dev
+
+          STRATEGY_CHANGED=false
+          if [ "$EVENT_NAME" = "push" ] && [ -n "$EVENT_BEFORE" ]; then
+            if git diff --name-only "$EVENT_BEFORE" "$EVENT_SHA" -- strategy.py | grep -qx 'strategy.py'; then
+              STRATEGY_CHANGED=true
+            fi
+          fi
+
+          LOOP_STATE=$(git show origin/dev:.github/loop_state.json 2>/dev/null || echo '{}')
+          export LOOP_STATE
+          export STRATEGY_CHANGED
+          python3 - <<'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from harness.catchup import plan_catch_up
+
+          now = datetime.now(timezone.utc)
+          state_path = Path(".github/catchup_state.json")
+          state = json.loads(state_path.read_text(encoding="utf-8"))
+          loop_state = json.loads(os.environ["LOOP_STATE"])
+          count_today = loop_state.get("count_date") == now.date().isoformat()
+          daily_count = int(loop_state.get("daily_count", 0)) if count_today else 0
+          capacity_available = daily_count < int(os.environ["MAX_DAILY_ITERATIONS"])
+          next_state, action, eval_date = plan_catch_up(
+              state,
+              event_name=os.environ["EVENT_NAME"],
+              strategy_changed=os.environ["STRATEGY_CHANGED"] == "true",
+              resume_after_reflection=os.environ["RESUME_AFTER_REFLECTION"] == "true",
+              now=now,
+              capacity_available=capacity_available,
+          )
+          changed = next_state != state
+          if changed:
+              next_state["updated_at"] = now.isoformat()
+          Path("/tmp/catchup_state.json").write_text(
+              json.dumps(next_state, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"action={action}\n")
+              output.write(f"eval_date={eval_date.isoformat() if eval_date else ''}\n")
+              output.write(f"state_changed={'true' if changed else 'false'}\n")
+          print(
+              f"Catch-up action={action} eval_date={eval_date} "
+              f"capacity_available={capacity_available} state={next_state['status']}"
+          )
+          PYEOF
+
+      - name: Persist catch-up state transition
+        if: steps.plan.outputs.state_changed == 'true'
+        run: |
+          cp /tmp/catchup_state.json .github/catchup_state.json
+          git add .github/catchup_state.json
+          git commit -m "chore: update catch-up state [skip ci]"
+          git push origin main
+
+  evaluate:
+    needs: prepare
+    if: needs.prepare.outputs.action == 'evaluate'
+    uses: fxquantbench/model-template/.github/workflows/_daily_eval.yml@main
+    secrets: inherit
+    with:
+      repo: ${{ github.repository }}
+      model_id: ${{ vars.MODEL_ID }}
+      eval_date: ${{ needs.prepare.outputs.eval_date }}
+      runner_image: ${{ vars.STRATEGY_RUNNER_IMAGE || 'ghcr.io/fxquantbench/strategy-runner:latest' }}
+
+  resume_reflection:
+    needs: prepare
+    if: needs.prepare.outputs.action == 'reflect'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resume deferred catch-up reflection
+        run: |
+          gh workflow run agentic_loop.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f trigger_source=catch_up_eval \
+            -f trigger_details="resume_after_capacity_reset=true"
+
+  record_result:
+    needs: [prepare, evaluate]
+    if: >-
+      ${{ always() && needs.prepare.outputs.action == 'evaluate' &&
+         needs.evaluate.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      EVAL_DATE: ${{ needs.prepare.outputs.eval_date }}
+      RESULT_STATUS: ${{ needs.evaluate.outputs.result_status }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BENCHMARK_BOT_TOKEN }}
+
+      - name: Advance catch-up state
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from harness.catchup import next_business_day
+
+          status = os.environ["RESULT_STATUS"]
+          if status not in {"created", "already_exists"}:
+              raise RuntimeError(f"Daily evaluation returned unexpected status: {status!r}")
+
+          path = Path(".github/catchup_state.json")
+          state = json.loads(path.read_text(encoding="utf-8"))
+          evaluated = datetime.fromisoformat(os.environ["EVAL_DATE"]).date()
+          state["last_eval_date"] = evaluated.isoformat()
+          state["next_eval_date"] = next_business_day(evaluated).isoformat()
+          state["status"] = "awaiting_reflection" if status == "created" else "running"
+          state["updated_at"] = datetime.now(timezone.utc).isoformat()
+          path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+          PYEOF
+
+      - name: Commit catch-up progress
+        run: |
+          git config user.name "benchmark-bot"
+          git config user.email "benchmark-bot@fxquantbench.io"
+          git add .github/catchup_state.json
+          git commit -m "chore: advance catch-up state [skip ci]"
+          git push origin main
+
+      - name: Continue catch-up
+        run: |
+          if [ "$RESULT_STATUS" = "created" ]; then
+            gh workflow run agentic_loop.yml \
+              --repo "${{ github.repository }}" \
+              --ref main \
+              -f trigger_source=catch_up_eval \
+              -f trigger_details="eval_date=${EVAL_DATE}"
+          else
+            gh workflow run catch_up_eval.yml \
+              --repo "${{ github.repository }}" \
+              --ref main
+          fi
