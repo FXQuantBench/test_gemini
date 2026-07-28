@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/sandbox/test_runner.py", line 546, in main
+    run_eda(conn)
+    ~~~~~~~^^^^^^
+  File "/sandbox/test_runner.py", line 323, in run_eda
+    exec(compile(source, eda_script, "exec"), script_globals)  # noqa: S102
+         ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sandbox/research/001_initial_eda.py", line 83
+    if __name__ == '__main__': 
+                               ^
+IndentationError: expected an indented block after 'if' statement on line 83
