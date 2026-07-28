@@ -216,6 +216,11 @@ class TestEvalLoopResume:
         assert '"research_summary.md"' in text
         assert "Catch-up reflection complete" in text
 
+    def test_agentic_loop_keeps_record_updates_as_a_separate_step(self):
+        text = _read(".github/workflows/agentic_loop.yml")
+        assert "\n      - name: Apply structured record updates\n" in text
+        assert "\n          - name: Apply structured record updates\n" not in text
+
 
 class TestCatchUpWorkflow:
     def test_catch_up_is_one_time_serialized_and_reflective(self):
